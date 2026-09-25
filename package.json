@@ -1,0 +1,20 @@
+{
+  "name": "tealtalk",
+  "version": "0.1.0",
+  "description": "TealTalk: an ad-free messenger that works the same on Android and iPhone. No blue bubbles, no green bubbles, just teal.",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning server/index.js",
+    "test": "node --no-warnings=ExperimentalWarning --test tests/*.test.js",
+    "test:e2e": "node tests/e2e/cross-platform.e2e.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "ws": "^8.21.3"
+  }
+}
