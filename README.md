@@ -34,6 +34,7 @@ PORT=8080 DATA_DIR=/srv/tealtalk npm start
 | `HOST` | `0.0.0.0` | bind address |
 | `DATA_DIR` | `./data` | SQLite database, uploaded photos and the generated push keys |
 | `VAPID_SUBJECT` | `mailto:admin@localhost` | contact address sent to push services |
+| `TRUST_PROXY` | unset | set to `1` behind a reverse proxy so login rate limits use the real client IP |
 
 ### Put it on your phones
 
@@ -45,7 +46,7 @@ chat.example.com {
 }
 ```
 
-Then:
+and start TealTalk with `TRUST_PROXY=1`. Then:
 
 - **iPhone:** open the site in Safari, tap **Share**, then **Add to Home Screen**. Open TealTalk from the home screen and enable notifications in Settings.
 - **Android:** open the site in Chrome and tap **Install app** (or use TealTalk's own Install button in Settings).
