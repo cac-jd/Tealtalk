@@ -1,6 +1,6 @@
 // An open conversation: message list, typing indicator, composer.
 
-import { Api, attachmentUrl } from '../api.js';
+import { Api, attachmentUrl, getToken } from '../api.js';
 import { h, clear, dayKey, formatDay, formatTime, isTouchDevice } from '../dom.js';
 import {
   state,
@@ -34,6 +34,8 @@ let openSeq = 0;
 let socketRef = null;
 let lastTypingSent = 0;
 let readPosted = 0;
+/** Whether the list was at the bottom as of the last scroll (images growing later don't scroll). */
+let pinnedToBottom = true;
 const drafts = new Map();
 
 /** key -> element for messages and day separators currently in the list */
@@ -100,13 +102,16 @@ export async function openChat(id) {
 }
 
 export function closeChat() {
+  // Logged out: forget unsent drafts so the next account on this device never sees them.
+  if (!getToken()) drafts.clear();
   if (!convId) return;
-  drafts.set(convId, $('message-input').value);
+  if (getToken()) drafts.set(convId, $('message-input').value);
   convId = null;
   openSeq++;
   elements.clear();
   clear($('message-list'));
   $('older-status').hidden = true;
+  pinnedToBottom = true;
   $('typing-indicator').hidden = true;
   closeViewer();
 }
@@ -149,6 +154,9 @@ async function fetchLatest(id) {
 /** Called after the socket (re)connects. */
 export async function catchUp() {
   const id = convId;
+  // Closed chats may have missed messages while we were disconnected, and a live message
+  // arriving before they are reopened would hide that gap from fetchLatest: drop them.
+  for (const cid of [...state.chats.keys()]) if (cid !== id) state.chats.delete(cid);
   if (!id) return;
   try {
     await fetchLatest(id);
@@ -328,7 +336,7 @@ function createMessageEl(item) {
     img.dataset.src = item.image;
     img.addEventListener('load', () => {
       // Images change height after load; stay pinned to the bottom if we were.
-      if (img.closest('.message') === img.closest('.message-list')?.lastElementChild) scrollToBottom();
+      if (pinnedToBottom && img.isConnected) scrollToBottom();
     });
     img.addEventListener('click', () => openViewer(img.src));
     bubble.appendChild(img);
@@ -656,10 +664,19 @@ export function initChat({ socket }) {
   $('messages').addEventListener(
     'scroll',
     () => {
+      pinnedToBottom = isNearBottom();
       if ($('messages').scrollTop < 200) loadOlder();
     },
     { passive: true },
   );
+
+  // The keyboard opening, the composer growing or the typing indicator appearing all
+  // shrink the list: keep the newest message in view if we were at the bottom.
+  if ('ResizeObserver' in window) {
+    new ResizeObserver(() => {
+      if (convId && pinnedToBottom) scrollToBottom();
+    }).observe($('messages'));
+  }
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && viewer) closeViewer();

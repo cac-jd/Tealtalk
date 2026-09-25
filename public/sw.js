@@ -65,7 +65,9 @@ function isLive(url) {
 async function shellFetch(request, cacheKey) {
   const cache = await caches.open(CACHE);
   const network = fetch(request).then((response) => {
-    if (response.ok && response.type === 'basic') cache.put(cacheKey, response.clone()).catch(() => {});
+    // Only an HTML page may become the app shell (not, say, an icon opened in a tab).
+    const isShell = cacheKey !== '/index.html' || (response.headers.get('content-type') || '').startsWith('text/html');
+    if (response.ok && response.type === 'basic' && isShell) cache.put(cacheKey, response.clone()).catch(() => {});
     return response;
   });
   network.catch(() => {}); // avoid an unhandled rejection if the timeout wins

@@ -4,9 +4,15 @@
 
 On most phones, who you can message and how well depends on which phone you and your friends bought. TealTalk ignores that. Everyone gets the same app, the same colours and the same features: read receipts, typing indicators, photos and group chats. Your messages are teal and everyone else's are grey, on every device.
 
-- **No ads, no trackers, no analytics.** The app loads nothing from third parties, and a strict Content-Security-Policy enforces that.
+- **No ads, no trackers, no analytics.** The app loads nothing from third parties: no CDNs, fonts or scripts from anyone else, backed by a strict Content-Security-Policy.
 - **Android and iPhone:** TealTalk is a Progressive Web App. Open it in the browser and add it to your home screen. It runs full screen like a native app, starts offline and gets push notifications. No app store is needed.
 - **You host it.** One small Node server with a single SQLite file. Your messages live on your server and nowhere else.
+
+| iPhone (Maya) | Android (Jordan) | Chats | Dark mode |
+| --- | --- | --- | --- |
+| ![iPhone](docs/screenshots/iphone-chat.png) | ![Android](docs/screenshots/android-chat.png) | ![Chat list](docs/screenshots/chats-list.png) | ![Dark mode](docs/screenshots/dark-mode.png) |
+
+The same conversation on both phones: your messages are teal and theirs are grey, whichever phone anyone uses.
 
 ## Features
 
@@ -57,6 +63,13 @@ and start TealTalk with `TRUST_PROXY=1`. Then:
 npm test            # server integration tests
 npm run test:e2e    # browser test: an iPhone user and an Android user chatting (needs Playwright + Chromium)
 ```
+
+## Known limitations (prototype)
+
+- Messages are protected in transit by HTTPS and stored unencrypted on your server. There's no end-to-end encryption yet.
+- The e2e test emulates the iPhone with Chromium's iPhone 13 profile. Real Safari on iOS has not been tested yet, particularly how the composer behaves when the keyboard opens.
+- A photo queued while offline is lost if the app is closed before it reconnects. Queued text messages are kept.
+- There is no password reset yet.
 
 ## How it's built
 

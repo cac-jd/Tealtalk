@@ -94,13 +94,18 @@ function mergeConversation(old, fresh) {
     readUpTo[uid] = Math.max(readUpTo[uid] || 0, id || 0);
   }
   let lastMessage = fresh.lastMessage;
+  let unreadCount = fresh.unreadCount;
   if (old.lastMessage && (!lastMessage || old.lastMessage.id > lastMessage.id)) {
+    // The snapshot predates messages we already got live, so its unread count is too low.
+    // Don't let it hide them; refreshConversations() fetches again to get the exact count.
     lastMessage = old.lastMessage;
+    unreadCount = Math.max(fresh.unreadCount || 0, old.unreadCount || 0);
   }
   return {
     ...fresh,
     readUpTo,
     lastMessage,
+    unreadCount,
     updatedAt: Math.max(fresh.updatedAt || 0, lastMessage ? lastMessage.createdAt : 0),
   };
 }

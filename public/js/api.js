@@ -57,9 +57,12 @@ export async function api(path, { method = 'GET', body, raw, contentType, auth =
     headers['Content-Type'] = 'application/json';
   }
 
+  // A connection that died while iOS had the app suspended can hang forever;
+  // time out so the outbox retries (the server dedups sends by clientId).
+  const signal = AbortSignal.timeout(raw !== undefined ? 120000 : 20000);
   let res;
   try {
-    res = await fetch(path, { method, headers, body: payload, cache: 'no-store' });
+    res = await fetch(path, { method, headers, body: payload, cache: 'no-store', signal });
   } catch {
     throw new ApiError(0, navigator.onLine ? 'Could not reach TealTalk.' : 'You are offline.');
   }

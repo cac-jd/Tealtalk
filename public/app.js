@@ -121,10 +121,16 @@ async function handleIncoming(message) {
   }
 }
 
-async function refreshConversations() {
+async function refreshConversations(again = true) {
   try {
     const { conversations } = await Api.conversations();
+    // Messages that arrived live while this was in flight make the snapshot stale: fetch once more.
+    const stale = conversations.some((c) => {
+      const known = getConversation(c.id);
+      return known && known.lastMessage && (!c.lastMessage || known.lastMessage.id > c.lastMessage.id);
+    });
     setConversations(conversations);
+    if (stale && again) refreshConversations(false);
   } catch {
     /* offline: keep the cached list */
   }
