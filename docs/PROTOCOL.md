@@ -155,3 +155,58 @@ The client is a single page (`public/index.html` + `public/app.js`). The e2e tes
 Screens that are not active must be hidden (`hidden` attribute or `display:none`) so Playwright's visibility checks work.
 
 Every testid is unique in the page: list items (`conversation-item`, `user-result`, `message`) exist only while their screen is open.
+
+## Text messages to any phone number (SMS/MMS via Twilio)
+
+TealTalk can text phone numbers that don't use TealTalk. It goes through a Twilio phone number, so it works the same whether the TealTalk user is on an iPhone or an Android phone. The feature is **off** unless the Twilio env vars are set.
+
+### Configuration
+
+| Env | Example | Meaning |
+| --- | --- | --- |
+| `PUBLIC_URL` | `https://tealtalk.up.railway.app` | the public https origin, no trailing slash. Required for SMS: webhook signatures are checked against it, and Twilio fetches outgoing photos from it. |
+| `TWILIO_ACCOUNT_SID` | `AC...` | |
+| `TWILIO_AUTH_TOKEN` | secret | also used to verify incoming webhooks |
+| `SMS_NUMBERS` | `+15551230000=chris,+15559870000=maya` | which Twilio number belongs to which TealTalk username. Only these users can text phone numbers, and texts from outsiders to that number go to that user. Comma separated. |
+| `SMS_DEFAULT_COUNTRY_CODE` | `1` | added to numbers typed without `+` (10 digits for `1`) |
+| `SIGNUP_CODE` | any string | if set, `POST /api/register` requires `{ signupCode }` to match (`403` otherwise). Always set it on a public server. |
+
+`createApp()` also accepts `{ sms: { accountSid, authToken, numbers: { "+1555...": "chris" }, publicUrl, apiBase, defaultCountryCode }, signupCode }` so tests can point `apiBase` at a fake Twilio server. Outbound calls use global `fetch`, so there's no new dependency.
+
+### Data shape changes
+
+```jsonc
+// Conversation gains:
+"sms": null,                        // or { "phone": "+15551234567" } for a text-message conversation
+                                    // (isGroup false, members = only the owning TealTalk user)
+// Message gains:
+"senderId": null,                   // null = sent by the outside phone number
+"sms": null                         // or { "status": "queued|sent|delivered|failed|received", "error": "human text or null" }
+```
+
+- Phone numbers are stored and returned in E.164 (`+15551234567`). Short codes (5-6 digits) from inbound texts are kept as the digits.
+- An SMS conversation's `title` is the contact name the owner gave it (null = show the formatted number).
+- There is one SMS conversation per (owning user, phone number). SMS conversations are always 1:1. Twilio can't do group texts.
+
+### HTTP API additions
+
+| Method & path | Body | Response |
+| --- | --- | --- |
+| `GET /api/me` | - | `{ user, sms: { enabled: bool, number: "+1555..." or null } }`: `enabled` means *this* user can text phone numbers |
+| `POST /api/sms/conversations` | `{ phone, title? }` | `201 { conversation }`, or `200` with the existing one. `400` on an invalid number, `403` if this user has no SMS number |
+| `PATCH /api/conversations/:id` | `{ title }` | `{ conversation }`. Any member can rename a group or an SMS contact (1-80 chars; `null`/`""` clears it on SMS contacts). `400` for 1:1 TealTalk chats. Sends a `conversation` WS event. |
+| `POST /api/conversations/:id/messages` | same as before | for SMS conversations the message is saved with `sms.status: "queued"`, then sent via Twilio asynchronously. The HTTP response doesn't wait for Twilio. Status changes go out as `message` WS events carrying the updated message (same id; clients replace it). |
+| `POST /api/sms/twilio` | Twilio form post | incoming text webhook. Checks `X-Twilio-Signature` against `PUBLIC_URL + "/api/sms/twilio"` (`403` if bad). `To` must be in `SMS_NUMBERS`. Finds or creates the conversation, saves the message with `senderId: null`, `sms.status: "received"`, downloads `MediaUrl0..9` images (jpeg/png/gif/webp, max 10 MB, with Basic auth) as attachments (one message per extra image), then does the usual WS fan-out and push. Replies with `200 text/xml` `<Response></Response>`. Deduplicates on `MessageSid`. |
+| `POST /api/sms/twilio/status` | Twilio form post | delivery status callback (same signature check; the URL passed as `StatusCallback` is `PUBLIC_URL + "/api/sms/twilio/status"`). Maps `MessageStatus` onto `sms.status`: queued/accepted/sending -> `queued`, sent -> `sent`, delivered -> `delivered`, failed/undelivered -> `failed` with a readable `error` from `ErrorCode` (e.g. 21610 -> "This number has opted out (they replied STOP)", 30003/30005/30006 -> "Couldn't be delivered to this number"). Status only moves forward, except to `failed`. |
+| `GET /api/sms/media/:attachmentId?exp=&sig=` | - | lets Twilio fetch an outgoing photo. `sig` = HMAC-SHA256(auth token, `attachmentId + "." + exp`) as base64url, and the link expires 1 hour after `exp` is issued. No login needed. |
+
+Outbound: `POST {apiBase}/2010-04-01/Accounts/{sid}/Messages.json` (default apiBase `https://api.twilio.com`), form-encoded `From`, `To`, `Body`, optional `MediaUrl` (the signed media URL), `StatusCallback`, with Basic auth `sid:token`. Store the returned `sid` on the message for status callbacks. A Twilio error response marks the message `failed` with its message text. Network failure: retry twice with backoff, then `failed`.
+
+### Client additions
+
+- New chat screen: when `sms.enabled`, a "Text a phone number" field. Typing a phone-like value shows a row that starts the SMS conversation.
+- SMS conversations look like any other chat: my bubbles teal, theirs grey. **Nobody is on blue or green, even for texts.** The header and list row show a small "Text message" label and the formatted number under the name. There's an option to set or edit the contact name.
+- My SMS messages' `message-status` reads `sending` (not yet acknowledged by TealTalk), then `queued`, `sent`, `delivered` or `failed`. A failed one shows the error text and a Retry that sends a new message with a new clientId.
+- Register form: a "Signup code" field (`auth-signupcode`). It's always shown in register mode, and it's harmless when the server doesn't require one.
+
+New testids: `auth-signupcode`, `sms-phone-input`, `sms-start-button`, `sms-badge` (on the chat header and on SMS `conversation-item`s), `rename-button`, `rename-input`, `rename-save-button`, `message-error` (error text on a failed SMS message).
