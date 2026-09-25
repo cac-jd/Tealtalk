@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Browser ES modules for the TealTalk client (lets `node --check` parse them as modules)."
+}

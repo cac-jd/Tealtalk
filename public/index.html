@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>TealTalk</title>
+  <meta name="description" content="TealTalk: an ad-free messenger that works the same on Android and iPhone. Nobody on blue.">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="color-scheme" content="light dark">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TealTalk">
+  <meta name="application-name" content="TealTalk">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="referrer" content="no-referrer">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" sizes="180x180">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <div class="connection" data-testid="connection-status" id="connection-status" role="status" aria-live="polite" hidden></div>
+
+    <!-- Auth -->
+    <section class="screen auth-screen" data-testid="auth-screen" id="auth-screen" hidden aria-labelledby="auth-heading">
+      <div class="auth-card">
+        <img class="auth-logo" src="/icons/icon.svg" alt="" width="72" height="72">
+        <h1 id="auth-heading" class="auth-title">TealTalk</h1>
+        <p class="auth-tagline">One messenger for everyone. No ads. Nobody on blue.</p>
+        <form id="auth-form" class="auth-form" novalidate>
+          <label class="field">
+            <span class="field-label">Username</span>
+            <input data-testid="auth-username" id="auth-username" name="username" type="text"
+                   autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false"
+                   minlength="3" maxlength="24" required enterkeyhint="next">
+          </label>
+          <label class="field" id="auth-displayname-field" hidden>
+            <span class="field-label">Display name <span class="optional">(optional)</span></span>
+            <input data-testid="auth-displayname" id="auth-displayname" name="displayName" type="text"
+                   autocomplete="nickname" maxlength="40" enterkeyhint="next">
+          </label>
+          <label class="field">
+            <span class="field-label">Password</span>
+            <input data-testid="auth-password" id="auth-password" name="password" type="password"
+                   autocomplete="current-password" minlength="8" maxlength="200" required enterkeyhint="go">
+          </label>
+          <p class="auth-hint" id="auth-hint" hidden>At least 8 characters. Usernames use a-z, 0-9 and _.</p>
+          <p class="form-error" data-testid="auth-error" id="auth-error" role="alert" hidden></p>
+          <button class="btn primary block" data-testid="auth-submit" id="auth-submit" type="submit">Log in</button>
+        </form>
+        <p class="auth-switch">
+          <span id="auth-switch-text">New to TealTalk?</span>
+          <button class="btn link" data-testid="auth-toggle" id="auth-toggle" type="button">Create account</button>
+        </p>
+      </div>
+    </section>
+
+    <!-- Chat list -->
+    <section class="screen chats-screen" data-testid="chats-screen" id="chats-screen" hidden aria-labelledby="chats-heading">
+      <header class="bar">
+        <h1 class="bar-title brand" id="chats-heading">
+          <img src="/icons/icon.svg" alt="" width="28" height="28" class="bar-logo">TealTalk
+        </h1>
+        <button class="icon-btn" data-testid="settings-button" id="settings-button" type="button" aria-label="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.5a.5.5 0 0 0-.6-.2l-2.5 1a7.3 7.3 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.5h-4a.5.5 0 0 0-.5.4l-.4 2.7a7.6 7.6 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.5a.5.5 0 0 0 .1.6L4.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.6l2 3.5c.1.2.4.3.6.2l2.5-1c.5.4 1.1.7 1.7 1l.4 2.6c0 .3.2.5.5.5h4c.3 0 .5-.2.5-.4l.4-2.7c.6-.3 1.2-.6 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.5a.5.5 0 0 0-.1-.6L19.4 13ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
+        </button>
+      </header>
+      <div class="scroll">
+        <ul class="conv-list" id="conv-list" aria-label="Conversations"></ul>
+        <div class="empty" id="chats-empty" hidden>
+          <p class="empty-title">No chats yet</p>
+          <p>Tap <strong>New chat</strong> to message someone. Everyone gets the same bubbles here.</p>
+        </div>
+      </div>
+      <button class="fab" data-testid="new-chat-button" id="new-chat-button" type="button" aria-label="New chat">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M4 4h12a3 3 0 0 1 3 3v2h-2V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h2v3.2L9.6 16H12v2H10.4L4 22v-4a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3Zm14 7h2v3h3v2h-3v3h-2v-3h-3v-2h3v-3Z"/></svg>
+        <span class="fab-label">New chat</span>
+      </button>
+    </section>
+
+    <!-- New chat -->
+    <section class="screen new-chat-screen" data-testid="new-chat-screen" id="new-chat-screen" hidden aria-labelledby="new-chat-heading">
+      <header class="bar">
+        <button class="icon-btn" data-testid="new-chat-back" id="new-chat-back" type="button" aria-label="Back to chats">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg>
+        </button>
+        <h1 class="bar-title" id="new-chat-heading">New chat</h1>
+      </header>
+      <div class="scroll new-chat-body">
+        <label class="field search-field">
+          <span class="sr-only">Search people</span>
+          <input data-testid="user-search-input" id="user-search-input" type="search"
+                 placeholder="Search by name or username" autocomplete="off" autocapitalize="none"
+                 autocorrect="off" spellcheck="false" enterkeyhint="search">
+        </label>
+        <div class="chips" id="selected-chips" aria-label="Selected people"></div>
+        <ul class="user-results" id="user-results" aria-label="Search results"></ul>
+        <p class="hint" id="search-hint" aria-live="polite">Find people by their name or username.</p>
+      </div>
+      <div class="new-chat-footer">
+        <label class="field">
+          <span class="sr-only">Group name (optional)</span>
+          <input data-testid="group-title-input" id="group-title-input" type="text"
+                 placeholder="Group name (optional)" maxlength="80" enterkeyhint="done">
+        </label>
+        <button class="btn primary" data-testid="create-chat-button" id="create-chat-button" type="button" disabled>Start chat</button>
+      </div>
+    </section>
+
+    <!-- Chat -->
+    <section class="screen chat-screen" data-testid="chat-screen" id="chat-screen" hidden aria-labelledby="chat-title">
+      <header class="bar chat-bar">
+        <button class="icon-btn" data-testid="back-button" id="back-button" type="button" aria-label="Back to chats">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg>
+          <span class="back-badge" id="back-badge" hidden></span>
+        </button>
+        <span class="chat-avatar" id="chat-avatar"></span>
+        <div class="chat-head">
+          <h1 class="bar-title chat-title" data-testid="chat-title" id="chat-title"></h1>
+          <p class="chat-subtitle" id="chat-subtitle"></p>
+        </div>
+      </header>
+      <div class="messages" id="messages" tabindex="-1">
+        <p class="older-status" id="older-status" hidden></p>
+        <div class="message-list" id="message-list" role="list" aria-label="Messages"></div>
+      </div>
+      <div class="typing" data-testid="typing-indicator" id="typing-indicator" hidden><span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span><span id="typing-text"></span></div>
+      <form class="composer" id="composer" autocomplete="off">
+        <label class="icon-btn attach-btn" title="Send a photo">
+          <input data-testid="attach-input" id="attach-input" type="file" accept="image/*" class="file-input" aria-label="Send a photo">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20 5h-3.2L15 3H9L7.2 5H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm-8 13a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm0-2a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/></svg>
+        </label>
+        <textarea data-testid="message-input" id="message-input" rows="1" maxlength="4000"
+                  placeholder="Message" aria-label="Message" enterkeyhint="send"></textarea>
+        <button class="send-btn" data-testid="send-button" id="send-button" type="submit" aria-label="Send">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg>
+        </button>
+      </form>
+    </section>
+
+    <!-- Settings -->
+    <section class="screen settings-screen" data-testid="settings-screen" id="settings-screen" hidden aria-labelledby="settings-heading">
+      <header class="bar">
+        <button class="icon-btn" data-testid="settings-back" id="settings-back" type="button" aria-label="Back to chats">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg>
+        </button>
+        <h1 class="bar-title" id="settings-heading">Settings</h1>
+      </header>
+      <div class="scroll settings-body">
+        <section class="card" aria-labelledby="profile-heading">
+          <h2 id="profile-heading">Profile</h2>
+          <div class="profile-row">
+            <span id="profile-avatar"></span>
+            <div>
+              <p class="profile-name" id="profile-name"></p>
+              <p class="profile-username" id="profile-username"></p>
+            </div>
+          </div>
+          <form id="settings-form" class="settings-form" novalidate>
+            <label class="field">
+              <span class="field-label">Display name</span>
+              <input data-testid="displayname-input" id="displayname-input" type="text" maxlength="40" autocomplete="nickname" enterkeyhint="done">
+            </label>
+            <p class="form-status" id="settings-status" role="status" aria-live="polite"></p>
+            <button class="btn primary" data-testid="save-settings-button" id="save-settings-button" type="submit">Save</button>
+          </form>
+        </section>
+
+        <section class="card" aria-labelledby="notif-heading">
+          <h2 id="notif-heading">Notifications</h2>
+          <p id="notif-text">Get notified about new messages when TealTalk is closed.</p>
+          <button class="btn secondary" data-testid="enable-notifications-button" id="enable-notifications-button" type="button">Enable notifications</button>
+          <div class="note" id="notif-ios-note" hidden>
+            <p><strong>On iPhone and iPad, add TealTalk to your Home Screen first.</strong>
+            Apple only delivers web notifications to apps opened from the Home Screen (iOS 16.4 or later).</p>
+            <ol>
+              <li>Tap the <strong>Share</strong> button in Safari.</li>
+              <li>Choose <strong>Add to Home Screen</strong>.</li>
+              <li>Open TealTalk from your Home Screen and come back here.</li>
+            </ol>
+          </div>
+          <p class="form-status" id="notif-status" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="card" aria-labelledby="install-heading">
+          <h2 id="install-heading">Install</h2>
+          <p id="install-text">Install TealTalk for a full-screen app with its own icon.</p>
+          <button class="btn secondary" data-testid="install-button" id="install-button" type="button" hidden>Install TealTalk</button>
+          <ol class="note" id="install-ios-steps" hidden>
+            <li>Tap the <strong>Share</strong> button in Safari's toolbar.</li>
+            <li>Scroll down and choose <strong>Add to Home Screen</strong>.</li>
+            <li>Tap <strong>Add</strong>. TealTalk now opens like any other app.</li>
+          </ol>
+        </section>
+
+        <section class="card" aria-labelledby="about-heading">
+          <h2 id="about-heading">About</h2>
+          <p>TealTalk has no ads, no trackers and no analytics. It loads nothing from anyone else's servers. Your bubbles are teal and everyone else's are grey, on every phone.</p>
+        </section>
+
+        <button class="btn danger block" data-testid="logout-button" id="logout-button" type="button">Log out</button>
+      </div>
+    </section>
+
+    <div class="sr-only" id="announcer" aria-live="polite" aria-atomic="true"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </div>
+</body>
+</html>

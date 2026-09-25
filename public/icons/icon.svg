@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>TealTalk</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+  </defs>
+  <rect id="backdrop" width="512" height="512" rx="116" fill="url(#bg)"/>
+  <g id="mark" transform="translate(0 -26)">
+    <!-- the other person's bubble: same family, no blue -->
+    <path fill="#99f6e4" d="M268 112h112a64 64 0 0 1 64 64v58a64 64 0 0 1-64 64h-4l30 50-74-50h-64a64 64 0 0 1-64-64v-58a64 64 0 0 1 64-64z"/>
+    <!-- your bubble -->
+    <path fill="#ffffff" d="M146 178h150a76 76 0 0 1 76 76v62a76 76 0 0 1-76 76h-98l-94 58 30-66a76 76 0 0 1-64-68v-62a76 76 0 0 1 76-76z"/>
+    <circle cx="170" cy="285" r="22" fill="#0f766e"/>
+    <circle cx="232" cy="285" r="22" fill="#0f766e"/>
+    <circle cx="294" cy="285" r="22" fill="#0f766e"/>
+  </g>
+</svg>

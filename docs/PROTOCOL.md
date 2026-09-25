@@ -127,7 +127,7 @@ The client is a single page (`public/index.html` + `public/app.js`). The e2e tes
 | `auth-screen` | the login/register screen container |
 | `auth-username`, `auth-password`, `auth-displayname` | inputs (`auth-displayname` only visible in register mode) |
 | `auth-submit` | submit button |
-| `auth-toggle` | switches between "Log in" and "Create account" |
+| `auth-toggle` | switches between "Log in" (the default mode) and "Create account" |
 | `auth-error` | error text |
 | `chats-screen` | the conversation list screen |
 | `new-chat-button` | opens the new-chat screen |
@@ -140,16 +140,18 @@ The client is a single page (`public/index.html` + `public/app.js`). The e2e tes
 | `create-chat-button` | creates (or opens) the chat |
 | `chat-screen` | an open conversation |
 | `chat-title` | conversation name in the header |
-| `back-button` | back to the list |
+| `back-button` | back to the list from a chat (the new-chat and settings screens use `new-chat-back` and `settings-back`, because testids must be unique in the page) |
 | `message` | one per message, with `data-message-id` (or `data-client-id` while pending) and `data-mine="true"|"false"` |
 | `message-body` | text inside a `message` |
 | `message-image` | `<img>` inside a `message` with an attachment |
-| `message-status` | on my own messages: `sending`, `sent` or `read` as text content (exact lowercase word) |
+| `message-status` | on my own messages: `sending`, `sent` or `read` as text content (exact lowercase word); `read` in a group means every other member has read it. `failed` (with a Retry button) only when the server rejects the message with a 4xx |
 | `typing-indicator` | visible while someone else is typing |
 | `message-input` | the composer textarea |
 | `send-button` | send |
 | `attach-input` | the `<input type="file" accept="image/*">` |
-| `settings-button`, `settings-screen`, `displayname-input`, `save-settings-button`, `logout-button`, `enable-notifications-button` | settings |
+| `settings-button`, `settings-screen`, `displayname-input`, `save-settings-button`, `logout-button`, `enable-notifications-button`, `install-button` | settings |
 | `connection-status` | hidden when connected; shows "Connecting..." / "Offline" otherwise |
 
 Screens that are not active must be hidden (`hidden` attribute or `display:none`) so Playwright's visibility checks work.
+
+Every testid is unique in the page: list items (`conversation-item`, `user-result`, `message`) exist only while their screen is open.
