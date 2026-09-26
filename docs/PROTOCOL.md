@@ -4,6 +4,7 @@ This is the single source of truth that the server (`server/`), the client (`pub
 
 ## Principles
 
+- **Full quality, both directions.** Photos and videos arrive exactly as they were sent: no downscaling, no "compressed for MMS". Reactions, replies, edits, unsend, voice messages and group management work identically between iPhone and Android.
 - **Same app on Android and iPhone.** The client is an installable PWA (Add to Home Screen on iOS Safari, Install on Android Chrome). No platform gets a different colour, fewer features or a "degraded" mode. Nobody is on blue: your bubbles are teal, everyone else's are neutral grey, on every device.
 - **No ads, no trackers, no analytics, no third-party requests.** The server never contacts anyone except the push service the user's own browser picked (Apple/Google/Mozilla web push endpoints). The client loads nothing from a CDN; everything is served from the TealTalk server. CSP enforces this.
 - **Zero-build.** Plain HTML/CSS/ES modules in `public/`. Node 22.5+ server. Only npm dependencies: `ws` and `web-push`.
@@ -156,59 +157,106 @@ Screens that are not active must be hidden (`hidden` attribute or `display:none`
 
 Every testid is unique in the page: list items (`conversation-item`, `user-result`, `message`) exist only while their screen is open.
 
-## Text messages to any phone number (SMS/MMS via Twilio)
+## Full-quality messaging (v2)
 
-TealTalk can text phone numbers that don't use TealTalk. It goes through a Twilio phone number, so it works the same whether the TealTalk user is on an iPhone or an Android phone. The feature is **off** unless the Twilio env vars are set.
+This section extends and, where it conflicts, overrides the sections above. Texting to phone numbers (SMS/Twilio) was removed: both people use TealTalk.
 
-### Configuration
+### Configuration additions
 
-| Env | Example | Meaning |
+| Env | Default | Meaning |
 | --- | --- | --- |
-| `PUBLIC_URL` | `https://tealtalk.up.railway.app` | the public https origin, no trailing slash. Required for SMS: webhook signatures are checked against it, and Twilio fetches outgoing photos from it. |
-| `TWILIO_ACCOUNT_SID` | `AC...` | |
-| `TWILIO_AUTH_TOKEN` | secret | also used to verify incoming webhooks |
-| `SMS_NUMBERS` | `+15551230000=chris,+15559870000=maya` | which Twilio number belongs to which TealTalk username. Only these users can text phone numbers, and texts from outsiders to that number go to that user. Comma separated. |
-| `SMS_DEFAULT_COUNTRY_CODE` | `1` | added to numbers typed without `+` (10 digits for `1`) |
-| `SIGNUP_CODE` | any string | if set, `POST /api/register` requires `{ signupCode }` to match (`403` otherwise). Always set it on a public server. |
-
-`createApp()` also accepts `{ sms: { accountSid, authToken, numbers: { "+1555...": "chris" }, publicUrl, apiBase, defaultCountryCode }, signupCode }` so tests can point `apiBase` at a fake Twilio server. Outbound calls use global `fetch`, so there's no new dependency.
+| `SIGNUP_CODE` | unset | if set, `POST /api/register` requires `{ signupCode }` to match (`403 { error: "That signup code isn't right." }`) |
+| `MAX_UPLOAD_MB` | `250` | largest single photo/video/voice file |
+| `MEDIA_RETENTION_DAYS` | `0` (keep forever) | if > 0, files older than this are deleted from the server (an hourly sweep). The message stays and its attachment gets `expired: true`. This is the main hosting-cost lever. |
 
 ### Data shape changes
 
 ```jsonc
-// Conversation gains:
-"sms": null,                        // or { "phone": "+15551234567" } for a text-message conversation
-                                    // (isGroup false, members = only the owning TealTalk user)
-// Message gains:
-"senderId": null,                   // null = sent by the outside phone number
-"sms": null                         // or { "status": "queued|sent|delivered|failed|received", "error": "human text or null" }
+// Attachment
+{
+  "id": "a_...", "mime": "video/mp4", "size": 48213450,
+  "kind": "image" | "video" | "audio",
+  "width": 1920, "height": 1080,      // null if unknown
+  "durationMs": 12000,                // video/audio, null otherwise/unknown
+  "thumbnailId": "a_..." | null,      // small JPEG preview (images and videos)
+  "expired": false                    // true once removed by MEDIA_RETENTION_DAYS
+}
+
+// Message gains
+"replyTo": null | { "id": 40, "senderId": "u_...", "body": "first 200 chars", "attachmentKind": "image" | null, "deleted": false },
+"reactions": { "❤️": ["u_a", "u_b"], "😂": ["u_c"] },   // {} when none; each user has at most ONE reaction per message
+"editedAt": null | 1790000000000,
+"deletedAt": null | 1790000000000,  // unsent: body "", attachment null, reactions {}, replyTo null
+"system": null | { "type": "member_added" | "member_left" | "renamed", "userIds": ["u_..."], "title": "..." }
+                                     // senderId is the person who did it; body is ""
 ```
 
-- Phone numbers are stored and returned in E.164 (`+15551234567`). Short codes (5-6 digits) from inbound texts are kept as the digits.
-- An SMS conversation's `title` is the contact name the owner gave it (null = show the formatted number).
-- Inbound attachments that aren't images (vCards, video) aren't downloaded. The message gets a note instead, e.g. `[1 attachment TealTalk can't show]`.
-- If a user is removed from `SMS_NUMBERS`, they can still read their old SMS conversations, but posting to them returns `403`.
-- There is one SMS conversation per (owning user, phone number). SMS conversations are always 1:1. Twilio can't do group texts.
+Every change to an existing message (reaction, edit, unsend) is broadcast as a normal `message` WS event carrying the full updated message with the same `id`. Clients replace it in place and never duplicate. Only brand-new messages count toward `unreadCount` and trigger push.
 
-### HTTP API additions
+Conversations are still returned as before; `sms` fields no longer exist. `GET /api/me` returns `{ user }`.
+
+### Uploads: full quality and resumable
+
+- Accepted types: images `image/jpeg|png|gif|webp`; video `video/mp4|video/quicktime|video/webm`; audio `audio/mp4|audio/aac|audio/mpeg|audio/webm|audio/ogg`. The server checks the file's first bytes (magic numbers) against the declared type family and rejects mismatches with `415`. Files are always served with the stored type and `X-Content-Type-Options: nosniff`.
+- **Small files (<= 10 MB)**: `POST /api/attachments` as before (raw body). Optional query `?width=&height=&durationMs=&thumbnailId=`.
+- **Any size up to `MAX_UPLOAD_MB`**: resumable, in chunks, so a dropped connection on a phone doesn't restart a 200 MB video:
 
 | Method & path | Body | Response |
 | --- | --- | --- |
-| `GET /api/me` | - | `{ user, sms: { enabled: bool, number: "+1555..." or null } }`: `enabled` means *this* user can text phone numbers |
-| `POST /api/sms/conversations` | `{ phone, title? }` | `201 { conversation }`, or `200` with the existing one. `400` on an invalid number, `403` if this user has no SMS number |
-| `PATCH /api/conversations/:id` | `{ title }` | `{ conversation }`. Any member can rename a group or an SMS contact (1-80 chars; `null`/`""` clears it on SMS contacts). `400` for 1:1 TealTalk chats. Sends a `conversation` WS event. |
-| `POST /api/conversations/:id/messages` | same as before, but the body is max 1600 chars in SMS conversations (Twilio's limit) | for SMS conversations the message is saved with `sms.status: "queued"`, then sent via Twilio asynchronously. The HTTP response doesn't wait for Twilio. Status changes go out as `message` WS events carrying the updated message (same id; clients replace it). |
-| `POST /api/sms/twilio` | Twilio form post | incoming text webhook. Checks `X-Twilio-Signature` against `PUBLIC_URL + "/api/sms/twilio"` (`403` if bad). `To` must be in `SMS_NUMBERS`. Finds or creates the conversation, saves the message with `senderId: null`, `sms.status: "received"`, downloads `MediaUrl0..9` images (jpeg/png/gif/webp, max 10 MB, with Basic auth) as attachments (one message per extra image), then does the usual WS fan-out and push. Replies with `200 text/xml` `<Response></Response>`. Deduplicates on `MessageSid`. |
-| `POST /api/sms/twilio/status` | Twilio form post | delivery status callback (same signature check; the URL passed as `StatusCallback` is `PUBLIC_URL + "/api/sms/twilio/status"`). Maps `MessageStatus` onto `sms.status`: queued/accepted/sending -> `queued`, sent -> `sent`, delivered -> `delivered`, failed/undelivered -> `failed` with a readable `error` from `ErrorCode` (e.g. 21610 -> "This number has opted out (they replied STOP)", 30003/30005/30006 -> "Couldn't be delivered to this number"). Status only moves forward, except to `failed`. |
-| `GET /api/sms/media/:attachmentId?exp=&sig=` | - | lets Twilio fetch an outgoing photo. `sig` = HMAC-SHA256(auth token, `attachmentId + "." + exp`) as base64url, and the link expires 1 hour after `exp` is issued. No login needed. |
+| `POST /api/uploads` | `{ mime, size }` | `201 { uploadId, chunkSize: 5242880, received: 0 }`. `413` if too big, `415` bad type |
+| `PUT /api/uploads/:id` | raw chunk (<= chunkSize), header `Upload-Offset: <n>` | `200 { received }`. `409 { received }` if the offset isn't exactly `received` (client resumes from there) |
+| `GET /api/uploads/:id` | - | `{ received, size }` |
+| `POST /api/uploads/:id/complete` | `{ width?, height?, durationMs?, thumbnailId? }` | `201 { attachment }` once `received == size` (else `409`). Magic-byte check happens here. |
 
-Outbound: `POST {apiBase}/2010-04-01/Accounts/{sid}/Messages.json` (default apiBase `https://api.twilio.com`), form-encoded `From`, `To`, `Body`, optional `MediaUrl` (the signed media URL), `StatusCallback`, with Basic auth `sid:token`. Store the returned `sid` on the message for status callbacks. A Twilio error response marks the message `failed` with its message text. Network failure: retry twice with backoff, then `failed`.
+Only the uploader can touch an upload. Unfinished uploads are deleted after 24 h.
+- `GET /api/attachments/:id` supports **HTTP Range requests** (`Accept-Ranges: bytes`, `206`, `416`). iPhone Safari won't play video without it. Same permission rules as before. `thumbnailId` attachments follow the permissions of the attachment that references them.
 
-### Client additions
+### Client rules for media
 
-- New chat screen: when `sms.enabled`, a "Text a phone number" field. Typing a phone-like value shows a row that starts the SMS conversation.
-- SMS conversations look like any other chat: my bubbles teal, theirs grey. **Nobody is on blue or green, even for texts.** The header and list row show a small "Text message" label and the formatted number under the name. There's an option to set or edit the contact name.
-- My SMS messages' `message-status` reads `sending` (not yet acknowledged by TealTalk), then `queued`, `sent`, `delivered` or `failed`. A failed one shows the error text and a Retry that sends a new message with a new clientId.
-- Register form: a "Signup code" field (`auth-signupcode`). It's always shown in register mode, and it's harmless when the server doesn't require one.
+- **Photos go at full resolution.** Don't downscale or re-encode the original. For JPEGs, remove the GPS location from the EXIF data in place (overwrite the GPS IFD values; keep orientation and everything else) so sharing a photo doesn't share where you live. Also make a small JPEG thumbnail (longest side 480px) for the chat bubble. Tapping opens a full-screen viewer (`image-viewer`) that loads the original.
+- **Videos go as the original file** with a poster thumbnail grabbed from an early frame. They play inline (`<video playsinline controls preload="metadata">`). If `video.canPlayType(mime)` says the device can't play it (e.g. an iPhone HEVC `.mov` on an older Android), show the poster plus a clear "Download to watch" link instead of a broken player.
+- **Voice messages**: hold or tap the mic (`record-button`) and record with MediaRecorder, **preferring `audio/mp4` (AAC)** because it plays on both iPhone and Android. Fall back to `audio/webm;codecs=opus` only if mp4 recording isn't supported. Show a player with duration.
+- Uploads show progress (`upload-progress`), survive a dropped connection (resume via `GET /api/uploads/:id`) and can be cancelled.
 
-New testids: `auth-signupcode`, `sms-phone-input`, `sms-start-button`, `sms-badge` (on the chat header and on SMS `conversation-item`s), `rename-button`, `rename-input`, `rename-save-button`, `message-error` (error text on a failed SMS message).
+### Reactions, replies, edit, unsend
+
+| Method & path | Body | Response |
+| --- | --- | --- |
+| `PUT /api/conversations/:id/messages/:msgId/reaction` | `{ emoji }` (1 emoji, max 16 bytes UTF-8) | `200 { message }`. Replaces my previous reaction on that message |
+| `DELETE /api/conversations/:id/messages/:msgId/reaction` | - | `200 { message }` |
+| `POST /api/conversations/:id/messages` | adds optional `replyToId` (same conversation, else `400`) | as before |
+| `PATCH /api/conversations/:id/messages/:msgId` | `{ body }` | `200 { message }`. Sender only (`403`), text messages only, within **15 minutes** of sending (`409` after), not system/deleted |
+| `DELETE /api/conversations/:id/messages/:msgId` | - | `200 { message }` (unsent). Sender only, within **24 hours**. Deletes the file(s) from disk too. Replies quoting it show `replyTo.deleted: true` |
+
+You can't react to, reply to or edit unsent or system messages (`400`).
+
+### Groups
+
+| Method & path | Body | Response |
+| --- | --- | --- |
+| `PATCH /api/conversations/:id` | `{ title }` | groups only (1-80 chars; `400` for 1:1 or empty). Adds a `renamed` system message |
+| `POST /api/conversations/:id/members` | `{ userIds: [...] }` | groups only, any member can add; `200 { conversation }`. Adds a `member_added` system message. New members see history from when they joined onward (messages before `joinedAfterMessageId` are hidden from them) |
+| `DELETE /api/conversations/:id/members/me` | - | leave a group (`204`). Adds a `member_left` system message. The conversation disappears from my list; I get a `conversation_removed` WS event `{ conversationId }` |
+
+Everyone affected gets a `conversation` WS event with the updated member list, and new members also get it so the chat appears for them.
+
+### New testids
+
+| testid | Element |
+| --- | --- |
+| `auth-signupcode` | signup code input (register mode only) |
+| `message-menu` | opened by long-press (touch) or right-click / hover button (desktop) on a message |
+| `reaction-option` | inside `message-menu`, one per quick emoji (`data-emoji`): ❤️ 👍 😂 😮 😢 🙏 |
+| `menu-reply`, `menu-edit`, `menu-unsend`, `menu-copy` | menu actions (edit/unsend only on my own eligible messages) |
+| `message-reactions` | reaction chips under a message; each chip is `reaction-chip` with `data-emoji`, text = emoji + count; tapping my own chip removes it |
+| `reply-preview`, `reply-cancel` | "Replying to ..." bar above the composer |
+| `message-reply-quote` | quoted message inside a reply bubble; clicking scrolls to the original |
+| `message-edited` | "Edited" label |
+| `message-unsent` | "This message was unsent" placeholder |
+| `edit-bar`, `edit-cancel` | shown while editing a message in the composer |
+| `message-video` | `<video>` in a message; `message-video-download` when the device can't play it |
+| `message-audio` | voice message player; `record-button`, `record-cancel`, `record-send` while recording |
+| `message-image` | now the **thumbnail** `<img>`; `image-viewer`, `image-viewer-close` for full size |
+| `upload-progress` | progress indicator on a sending media message; `upload-cancel` |
+| `system-message` | centered grey line for member_added / member_left / renamed |
+| `group-info-button`, `group-info-screen`, `add-members-button`, `leave-group-button`, `rename-button`, `rename-input`, `rename-save-button` | group management |
