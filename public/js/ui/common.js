@@ -42,4 +42,21 @@ export function icon(pathData) {
 
 export const ICONS = {
   check: 'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z',
+  more: 'M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm0 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z',
+  close: 'M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z',
 };
+
+// ---------- back navigation ----------
+
+let currentHash = location.hash || '#/';
+let previousHash = null;
+window.addEventListener('hashchange', () => {
+  previousHash = currentHash;
+  currentHash = location.hash || '#/';
+});
+
+/** Go back to `hash`: a real history step when that's where we came from (Android back stays right). */
+export function backTo(hash) {
+  if (previousHash === hash) history.back();
+  else location.hash = hash;
+}

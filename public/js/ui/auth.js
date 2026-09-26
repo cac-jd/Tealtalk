@@ -11,6 +11,7 @@ function setMode(next) {
   mode = next;
   const register = mode === 'register';
   $('auth-displayname-field').hidden = !register;
+  $('auth-signupcode-field').hidden = !register;
   $('auth-hint').hidden = !register;
   $('auth-submit').textContent = register ? 'Create account' : 'Log in';
   $('auth-toggle').textContent = register ? 'Log in' : 'Create account';
@@ -40,6 +41,7 @@ export function initAuth({ onAuthed }) {
     const username = $('auth-username').value.trim().toLowerCase();
     const password = $('auth-password').value;
     const displayName = $('auth-displayname').value.trim();
+    const signupCode = $('auth-signupcode').value.trim();
     if (!username || !password) {
       showError('Enter a username and password.');
       return;
@@ -51,12 +53,13 @@ export function initAuth({ onAuthed }) {
     try {
       const result =
         mode === 'register'
-          ? await Api.register(username, password, displayName || undefined)
+          ? await Api.register(username, password, displayName || undefined, signupCode || undefined)
           : await Api.login(username, password);
       setToken(result.token);
       setMe(result.user);
       $('auth-password').value = '';
       $('auth-displayname').value = '';
+      $('auth-signupcode').value = '';
       onAuthed();
     } catch (err) {
       showError(
@@ -64,6 +67,8 @@ export function initAuth({ onAuthed }) {
           ? 'Wrong username or password.'
           : err.message || 'Something went wrong. Please try again.',
       );
+      // 403 on register: the server wants a (different) signup code.
+      if (mode === 'register' && err.status === 403) $('auth-signupcode').focus();
     } finally {
       busy = false;
       submit.disabled = false;

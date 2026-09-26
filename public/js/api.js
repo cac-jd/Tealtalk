@@ -89,13 +89,16 @@ export async function api(path, { method = 'GET', body, raw, contentType, auth =
   return data;
 }
 
+const messagePath = (id, msgId) =>
+  `/api/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}`;
+
 export const Api = {
-  register: (username, password, displayName) =>
-    api('/api/register', {
-      method: 'POST',
-      body: displayName ? { username, password, displayName } : { username, password },
-      auth: false,
-    }),
+  register: (username, password, displayName, signupCode) => {
+    const body = { username, password };
+    if (displayName) body.displayName = displayName;
+    if (signupCode) body.signupCode = signupCode;
+    return api('/api/register', { method: 'POST', body, auth: false });
+  },
   login: (username, password) =>
     api('/api/login', { method: 'POST', body: { username, password }, auth: false }),
   logout: () => api('/api/logout', { method: 'POST' }),
@@ -109,26 +112,37 @@ export const Api = {
       method: 'POST',
       body: title ? { memberIds, title } : { memberIds },
     }),
+  renameConversation: (id, title) =>
+    api(`/api/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', body: { title } }),
+  addMembers: (id, userIds) =>
+    api(`/api/conversations/${encodeURIComponent(id)}/members`, { method: 'POST', body: { userIds } }),
+  leaveConversation: (id) =>
+    api(`/api/conversations/${encodeURIComponent(id)}/members/me`, { method: 'DELETE' }),
   messages: (id, { before, limit = 50 } = {}) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (before) params.set('before', String(before));
     return api(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
   },
-  sendMessage: (id, { clientId, body, attachmentId }) => {
+  sendMessage: (id, { clientId, body, attachmentId, replyToId }) => {
     const payload = { clientId };
     if (body) payload.body = body;
     if (attachmentId) payload.attachmentId = attachmentId;
+    if (replyToId) payload.replyToId = replyToId;
     return api(`/api/conversations/${encodeURIComponent(id)}/messages`, {
       method: 'POST',
       body: payload,
     });
   },
+  react: (id, msgId, emoji) =>
+    api(`${messagePath(id, msgId)}/reaction`, { method: 'PUT', body: { emoji } }),
+  unreact: (id, msgId) => api(`${messagePath(id, msgId)}/reaction`, { method: 'DELETE' }),
+  editMessage: (id, msgId, body) => api(messagePath(id, msgId), { method: 'PATCH', body: { body } }),
+  unsendMessage: (id, msgId) => api(messagePath(id, msgId), { method: 'DELETE' }),
   markRead: (id, messageId) =>
     api(`/api/conversations/${encodeURIComponent(id)}/read`, {
       method: 'POST',
       body: { messageId },
     }),
-  uploadAttachment: (blob) => api('/api/attachments', { method: 'POST', raw: blob }),
   pushPublicKey: () => api('/api/push/public-key'),
   pushSubscribe: (subscription) =>
     api('/api/push/subscribe', { method: 'POST', body: { subscription } }),

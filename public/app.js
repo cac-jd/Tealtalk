@@ -17,8 +17,10 @@ import {
   clearTyping,
   setPresence,
   setConnection,
-  memberById,
+  userName,
   conversationTitle,
+  messageSummary,
+  removeConversation,
 } from './js/store.js';
 import { loadOutbox, clearOutbox, flush } from './js/outbox.js';
 import { registerServiceWorker, disableNotifications } from './js/pwa.js';
@@ -34,7 +36,8 @@ import {
   maybeMarkRead,
 } from './js/ui/chat.js';
 import { initSettings, openSettings } from './js/ui/settings.js';
-import { announce } from './js/ui/common.js';
+import { initGroupInfo, openGroupInfo, closeGroupInfo } from './js/ui/groupinfo.js';
+import { announce, toast } from './js/ui/common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,11 +46,14 @@ const SCREENS = {
   chats: 'chats-screen',
   new: 'new-chat-screen',
   chat: 'chat-screen',
+  info: 'group-info-screen',
   settings: 'settings-screen',
 };
 
 let current = null;
 let sessionStarted = false;
+/** Which group the new-chat screen is adding people to (null: a new chat). */
+let newChatFor = null;
 
 // ---------- realtime ----------
 
@@ -73,6 +79,9 @@ function handleEvent(evt) {
       break;
     case 'conversation':
       if (evt.conversation) upsertConversation(evt.conversation);
+      break;
+    case 'conversation_removed':
+      if (evt.conversationId) handleRemoved(evt.conversationId);
       break;
     case 'read':
       applyRead(evt.conversationId, evt.userId, evt.messageId);
@@ -107,17 +116,27 @@ async function handleIncoming(message) {
 
   clearTyping(convId, message.senderId);
   const conv = getConversation(convId);
-  const sender = memberById(conv, message.senderId);
-  const who = sender ? sender.displayName : 'Someone';
-  const text = message.body || (message.attachment ? 'Photo' : '');
+  const who = userName(conv, message.senderId);
+  const text = messageSummary(conv, message);
 
   if (isChatVisible(convId)) {
     maybeMarkRead();
-    announce(`${who}: ${text}`);
+    announce(message.system ? text : `${who}: ${text}`);
   } else {
     if (!fetched) incrementUnread(convId);
     const where = conv && conv.isGroup ? ` in ${conversationTitle(conv)}` : '';
     announce(`New message from ${who}${where}`);
+  }
+}
+
+/** I left a group (maybe on another device): drop it and get out of its screens. */
+function handleRemoved(convId) {
+  const conv = getConversation(convId);
+  const open = (location.hash || '').startsWith(`#/c/${encodeURIComponent(convId)}`);
+  removeConversation(convId);
+  if (open) {
+    location.replace('#/');
+    toast(conv && conv.isGroup ? `You're no longer in “${conversationTitle(conv)}”.` : 'That chat was removed.');
   }
 }
 
@@ -210,18 +229,26 @@ function route() {
   // A token can appear without a reload (e.g. set by another tab).
   if (!sessionStarted) startSession();
   const hash = location.hash || '#/';
-  const chatMatch = hash.match(/^#\/c\/([^/?#]+)/);
+  const chatMatch = hash.match(/^#\/c\/([^/?#]+)(?:\/(info|add))?$/);
+  const sub = chatMatch ? chatMatch[2] || null : null;
+  const isNew = hash === '#/new' || sub === 'add';
 
-  if (!chatMatch) closeChat();
-  if (hash !== '#/new') closeNewChat();
+  if (!chatMatch || sub) closeChat();
+  if (!chatMatch || sub !== 'info') closeGroupInfo();
+  if (!isNew) closeNewChat();
 
-  if (chatMatch) {
-    showScreen('chat');
-    openChat(decodeURIComponent(chatMatch[1]));
-  } else if (hash === '#/new') {
-    if (current !== 'new') openNewChat();
+  if (chatMatch && sub === 'info') {
+    showScreen('info');
+    openGroupInfo(decodeURIComponent(chatMatch[1]));
+  } else if (isNew) {
+    const addTo = sub === 'add' ? decodeURIComponent(chatMatch[1]) : null;
+    if (current !== 'new' || addTo !== newChatFor) openNewChat(addTo);
+    newChatFor = addTo;
     showScreen('new');
     if (!matchMedia('(pointer: coarse)').matches) $('user-search-input').focus();
+  } else if (chatMatch) {
+    showScreen('chat');
+    openChat(decodeURIComponent(chatMatch[1]));
   } else if (hash === '#/settings') {
     showScreen('settings');
     openSettings();
@@ -268,6 +295,7 @@ function boot() {
   initChats();
   initNewChat();
   initChat({ socket });
+  initGroupInfo();
   initSettings({ onLogout: logout });
 
   on('connection', renderConnection);

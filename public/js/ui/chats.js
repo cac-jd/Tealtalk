@@ -9,6 +9,7 @@ import {
   otherMembers,
   memberById,
   typingUsers,
+  messageSummary,
 } from '../store.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,7 +23,9 @@ export function previewText(conv) {
   }
   const msg = conv.lastMessage;
   if (!msg) return conv.isGroup ? 'New group' : 'Say hi';
-  const text = msg.body ? msg.body.replace(/\s+/g, ' ') : msg.attachment ? 'Photo' : '';
+  const text = messageSummary(conv, msg);
+  if (msg.system) return text;
+  if (msg.deletedAt) return msg.senderId === (state.me && state.me.id) ? 'You unsent a message' : 'A message was unsent';
   if (state.me && msg.senderId === state.me.id) return `You: ${text}`;
   if (conv.isGroup) {
     const sender = memberById(conv, msg.senderId);

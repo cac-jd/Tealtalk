@@ -2,7 +2,7 @@
 // Never caches /api or /ws: messages and attachments always come from the server
 // (attachments rely on the browser's normal HTTP cache instead).
 
-const CACHE = 'tealtalk-shell-v1';
+const CACHE = 'tealtalk-shell-v3';
 const SHELL = [
   '/',
   '/index.html',
@@ -15,11 +15,17 @@ const SHELL = [
   '/js/pwa.js',
   '/js/socket.js',
   '/js/store.js',
+  '/js/uploads.js',
+  '/js/video.js',
   '/js/ui/auth.js',
   '/js/ui/chat.js',
   '/js/ui/chats.js',
   '/js/ui/common.js',
+  '/js/ui/groupinfo.js',
+  '/js/ui/media.js',
+  '/js/ui/menu.js',
   '/js/ui/newchat.js',
+  '/js/ui/recorder.js',
   '/js/ui/settings.js',
   '/manifest.webmanifest',
   '/icons/icon.svg',

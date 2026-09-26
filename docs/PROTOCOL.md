@@ -268,3 +268,12 @@ Everyone affected gets a `conversation` WS event with the updated member list, a
 | `upload-progress` | progress indicator on a sending media message; `upload-cancel` |
 | `system-message` | centered grey line for member_added / member_left / renamed |
 | `group-info-button`, `group-info-screen`, `add-members-button`, `leave-group-button`, `rename-button`, `rename-input`, `rename-save-button` | group management |
+| `group-info-back` | back from group info to the chat |
+
+Notes on the client:
+- Group info is at `#/c/<id>/info`; `rename-button` lives there, not in the chat header. Adding members reuses the new-chat screen at `#/c/<id>/add` (`user-search-input`, `user-result`, `create-chat-button`, which reads "Add to group").
+- Unsend and leave group ask with the browser's standard confirm dialog. Tests accept it with `page.on('dialog', d => d.accept())`.
+- A `reaction-chip`'s text is the emoji followed by the count, e.g. `❤️2`.
+- System messages render only as `system-message`, never as `message`.
+- An iPhone `.mov` video is tried in the player even when `canPlayType('video/quicktime')` says no, because most are H.264/HEVC that Android plays. `message-video-download` shows on a playback error.
+- Photos with no GPS pointer are sent byte-for-byte untouched. JPEGs with GPS have it zeroed in place. Anything unreadable that still has a GPS pointer, and non-JPEG formats like HEIC, are re-encoded at full size.

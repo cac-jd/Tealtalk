@@ -48,6 +48,12 @@
             <input data-testid="auth-password" id="auth-password" name="password" type="password"
                    autocomplete="current-password" minlength="8" maxlength="200" required enterkeyhint="go">
           </label>
+          <label class="field" id="auth-signupcode-field" hidden>
+            <span class="field-label">Signup code <span class="optional">(if you were given one)</span></span>
+            <input data-testid="auth-signupcode" id="auth-signupcode" name="signupCode" type="text"
+                   autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
+                   maxlength="200" enterkeyhint="go">
+          </label>
           <p class="auth-hint" id="auth-hint" hidden>At least 8 characters. Usernames use a-z, 0-9 and _.</p>
           <p class="form-error" data-testid="auth-error" id="auth-error" role="alert" hidden></p>
           <button class="btn primary block" data-testid="auth-submit" id="auth-submit" type="submit">Log in</button>
@@ -102,7 +108,7 @@
         <p class="hint" id="search-hint" aria-live="polite">Find people by their name or username.</p>
       </div>
       <div class="new-chat-footer">
-        <label class="field">
+        <label class="field" id="group-title-field">
           <span class="sr-only">Group name (optional)</span>
           <input data-testid="group-title-input" id="group-title-input" type="text"
                  placeholder="Group name (optional)" maxlength="80" enterkeyhint="done">
@@ -123,22 +129,59 @@
           <h1 class="bar-title chat-title" data-testid="chat-title" id="chat-title"></h1>
           <p class="chat-subtitle" id="chat-subtitle"></p>
         </div>
+        <button class="icon-btn" data-testid="group-info-button" id="group-info-button" type="button" aria-label="Group info" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z"/></svg>
+        </button>
       </header>
       <div class="messages" id="messages" tabindex="-1">
         <p class="older-status" id="older-status" hidden></p>
         <div class="message-list" id="message-list" role="list" aria-label="Messages"></div>
       </div>
       <div class="typing" data-testid="typing-indicator" id="typing-indicator" hidden><span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span><span id="typing-text"></span></div>
+      <div class="composer-bar" data-testid="reply-preview" id="reply-preview" hidden>
+        <span class="composer-bar-accent" aria-hidden="true"></span>
+        <div class="composer-bar-text">
+          <p class="composer-bar-title" id="reply-preview-title">Replying</p>
+          <p class="composer-bar-snippet" id="reply-preview-snippet"></p>
+        </div>
+        <button class="icon-btn small" data-testid="reply-cancel" id="reply-cancel" type="button" aria-label="Cancel reply">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z"/></svg>
+        </button>
+      </div>
+      <div class="composer-bar" data-testid="edit-bar" id="edit-bar" hidden>
+        <span class="composer-bar-accent" aria-hidden="true"></span>
+        <div class="composer-bar-text">
+          <p class="composer-bar-title">Editing message</p>
+          <p class="composer-bar-snippet" id="edit-bar-snippet"></p>
+        </div>
+        <button class="icon-btn small" data-testid="edit-cancel" id="edit-cancel" type="button" aria-label="Cancel editing">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z"/></svg>
+        </button>
+      </div>
       <form class="composer" id="composer" autocomplete="off">
-        <label class="icon-btn attach-btn" title="Send a photo">
-          <input data-testid="attach-input" id="attach-input" type="file" accept="image/*" class="file-input" aria-label="Send a photo">
+        <label class="icon-btn attach-btn" id="attach-button" title="Send a photo or video">
+          <input data-testid="attach-input" id="attach-input" type="file" accept="image/*,video/*" class="file-input" aria-label="Send a photo or video">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20 5h-3.2L15 3H9L7.2 5H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm-8 13a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm0-2a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/></svg>
         </label>
         <textarea data-testid="message-input" id="message-input" rows="1" maxlength="4000"
                   placeholder="Message" aria-label="Message" enterkeyhint="send"></textarea>
+        <button class="icon-btn record-btn" data-testid="record-button" id="record-button" type="button" aria-label="Record a voice message">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1a7 7 0 0 0 6-6.9z"/></svg>
+        </button>
         <button class="send-btn" data-testid="send-button" id="send-button" type="submit" aria-label="Send">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg>
         </button>
+        <div class="recording" id="recording" role="group" aria-label="Recording a voice message" hidden>
+          <button class="icon-btn rec-cancel" data-testid="record-cancel" id="record-cancel" type="button" aria-label="Discard voice message">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z"/></svg>
+          </button>
+          <span class="rec-dot" aria-hidden="true"></span>
+          <span class="rec-time" id="record-time" role="timer" aria-live="off">0:00</span>
+          <span class="rec-label" id="record-label">Recording…</span>
+          <button class="send-btn" data-testid="record-send" id="record-send" type="button" aria-label="Send voice message">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg>
+          </button>
+        </div>
       </form>
     </section>
 
@@ -205,6 +248,54 @@
         <button class="btn danger block" data-testid="logout-button" id="logout-button" type="button">Log out</button>
       </div>
     </section>
+
+    <!-- Group info -->
+    <section class="screen group-info-screen" data-testid="group-info-screen" id="group-info-screen" hidden aria-labelledby="group-info-heading">
+      <header class="bar">
+        <button class="icon-btn" data-testid="group-info-back" id="group-info-back" type="button" aria-label="Back to chat">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg>
+        </button>
+        <h1 class="bar-title" id="group-info-heading">Group info</h1>
+      </header>
+      <div class="scroll settings-body">
+        <section class="card group-card" aria-labelledby="group-info-name">
+          <span id="group-info-avatar"></span>
+          <h2 class="group-name" id="group-info-name"></h2>
+          <p class="group-count" id="group-info-count"></p>
+          <button class="btn secondary" data-testid="rename-button" id="rename-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M3 17.25V21h3.75L17.8 9.94l-3.75-3.75zM20.7 7.04a1 1 0 0 0 0-1.41l-2.33-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75z"/></svg>
+            Rename group
+          </button>
+        </section>
+        <section class="card" aria-labelledby="members-heading">
+          <h2 id="members-heading">Members</h2>
+          <ul class="member-list" id="group-members" aria-labelledby="members-heading"></ul>
+          <button class="btn secondary block" data-testid="add-members-button" id="add-members-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2zm9 4c-2.7 0-8 1.3-8 4v2h16v-2c0-2.7-5.3-4-8-4Z"/></svg>
+            Add people
+          </button>
+        </section>
+        <button class="btn danger block" data-testid="leave-group-button" id="leave-group-button" type="button">Leave group</button>
+      </div>
+    </section>
+
+    <!-- Rename a group -->
+    <dialog class="sheet" id="rename-dialog" aria-labelledby="rename-heading">
+      <form class="sheet-form" id="rename-form" novalidate>
+        <h2 class="sheet-title" id="rename-heading">Rename group</h2>
+        <p class="sheet-text" id="rename-text">Everyone in the group sees the new name.</p>
+        <label class="field">
+          <span class="field-label" id="rename-label">Group name</span>
+          <input data-testid="rename-input" id="rename-input" type="text" maxlength="80"
+                 autocomplete="off" enterkeyhint="done" required>
+        </label>
+        <p class="form-error" id="rename-error" role="alert" hidden></p>
+        <div class="sheet-actions">
+          <button class="btn secondary" id="rename-cancel" type="button">Cancel</button>
+          <button class="btn primary" data-testid="rename-save-button" id="rename-save-button" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
 
     <div class="sr-only" id="announcer" aria-live="polite" aria-atomic="true"></div>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

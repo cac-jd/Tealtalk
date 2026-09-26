@@ -29,13 +29,22 @@ export const state = {
   pending: new Map(),
   /** convId -> Map<userId, timeoutHandle> */
   typing: new Map(),
+  /** userId -> User: everyone seen in any conversation (names for people who left a group) */
+  users: new Map(),
   /** userIds known to be online */
   online: new Set(),
   connection: 'offline',
 };
 
 // Restore the cached chat list so the app can launch offline.
-for (const conv of storage.get(CONV_CACHE_KEY, [])) state.conversations.set(conv.id, conv);
+for (const conv of storage.get(CONV_CACHE_KEY, [])) {
+  state.conversations.set(conv.id, conv);
+  rememberUsers(conv);
+}
+
+function rememberUsers(conv) {
+  for (const m of (conv && conv.members) || []) state.users.set(m.id, m);
+}
 
 let persistTimer = null;
 function persistConversations() {
@@ -53,6 +62,7 @@ export function resetState() {
   for (const users of state.typing.values()) for (const t of users.values()) clearTimeout(t);
   state.typing.clear();
   state.online.clear();
+  state.users.clear();
   storage.remove(CONV_CACHE_KEY);
   storage.remove(ME_KEY);
 }
@@ -74,12 +84,16 @@ export function sortedConversations() {
 export function setConversations(list) {
   const previous = state.conversations;
   state.conversations = new Map();
-  for (const conv of list) state.conversations.set(conv.id, mergeConversation(previous.get(conv.id), conv));
+  for (const conv of list) {
+    rememberUsers(conv);
+    state.conversations.set(conv.id, mergeConversation(previous.get(conv.id), conv));
+  }
   persistConversations();
   emit('conversations');
 }
 
 export function upsertConversation(conv) {
+  rememberUsers(conv);
   state.conversations.set(conv.id, mergeConversation(state.conversations.get(conv.id), conv));
   persistConversations();
   emit('conversations');
@@ -121,6 +135,24 @@ export function otherMembers(conv) {
 
 export function memberById(conv, userId) {
   return (conv && (conv.members || []).find((m) => m.id === userId)) || null;
+}
+
+/** I left the group (or was removed): forget it and anything unsent in it. */
+export function removeConversation(convId) {
+  if (!state.conversations.has(convId) && !state.chats.has(convId)) return;
+  state.conversations.delete(convId);
+  state.chats.delete(convId);
+  for (const [clientId, p] of state.pending) if (p.conversationId === convId) state.pending.delete(clientId);
+  persistConversations();
+  emit('conversations');
+  emit('conversation-removed', convId);
+}
+
+/** A user's display name, also for people who have since left the conversation. */
+export function userName(conv, userId) {
+  if (state.me && userId === state.me.id) return state.me.displayName;
+  const m = memberById(conv, userId) || state.users.get(userId);
+  return m ? m.displayName : 'Someone';
 }
 
 export function conversationTitle(conv) {
@@ -178,9 +210,14 @@ export function getChat(convId) {
 export function addMessages(convId, messages, { silent = false } = {}) {
   const chat = getChat(convId);
   const added = [];
-  for (const msg of messages) {
-    if (!chat.messages.has(msg.id)) added.push(msg);
+  let newest = null;
+  for (const incoming of messages) {
+    const old = chat.messages.get(incoming.id);
+    // Same id again (a reaction, edit or unsend): replace it in place, never duplicate.
+    const msg = old ? mergeMessage(old, incoming) : incoming;
+    if (!old) added.push(msg);
     chat.messages.set(msg.id, msg);
+    if (!newest || msg.id > newest.id) newest = msg;
     if (msg.clientId && state.me && msg.senderId === state.me.id) {
       const pending = state.pending.get(msg.clientId);
       if (pending) {
@@ -189,9 +226,8 @@ export function addMessages(convId, messages, { silent = false } = {}) {
       }
     }
   }
-  const newest = messages.reduce((a, m) => (!a || m.id > a.id ? m : a), null);
   const conv = state.conversations.get(convId);
-  if (conv && newest && (!conv.lastMessage || newest.id > conv.lastMessage.id)) {
+  if (conv && newest && (!conv.lastMessage || newest.id >= conv.lastMessage.id)) {
     state.conversations.set(convId, {
       ...conv,
       lastMessage: newest,
@@ -202,6 +238,82 @@ export function addMessages(convId, messages, { silent = false } = {}) {
   }
   if (!silent) emit('messages', convId);
   return added;
+}
+
+/**
+ * A message we already have arrived again (a live update over WebSocket, or a
+ * page fetched while one was in flight). Take the newer copy, but never let a
+ * stale snapshot undo an unsend or an edit.
+ */
+function mergeMessage(old, fresh) {
+  if (old.deletedAt && !fresh.deletedAt) return old;
+  if ((old.editedAt || 0) > (fresh.editedAt || 0)) return { ...fresh, body: old.body, editedAt: old.editedAt };
+  return fresh;
+}
+
+/** Replace one message locally (optimistic reactions); the server's copy follows. */
+export function replaceMessage(convId, msg) {
+  const chat = state.chats.get(convId);
+  if (!chat || !chat.messages.has(msg.id)) return;
+  chat.messages.set(msg.id, msg);
+  emit('messages', convId);
+}
+
+export function findMessage(convId, id) {
+  const chat = state.chats.get(convId);
+  return (chat && chat.messages.get(id)) || null;
+}
+
+// ---- message descriptions ----
+
+const KIND_LABEL = { image: 'Photo', video: 'Video', audio: 'Voice message' };
+
+/** image | video | audio (older attachments have no `kind`: go by the type). */
+export function attachmentKind(att) {
+  if (!att) return null;
+  if (att.kind) return att.kind;
+  const mime = att.mime || '';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  return 'image';
+}
+
+export function kindLabel(kind) {
+  return KIND_LABEL[kind] || 'Attachment';
+}
+
+/** "Maya added Sam and Jordan" etc. */
+export function systemText(conv, msg) {
+  const sys = msg.system || {};
+  const meId = state.me && state.me.id;
+  const actor = msg.senderId === meId ? 'You' : userName(conv, msg.senderId);
+  const names = (sys.userIds || []).map((id) => (id === meId ? 'you' : userName(conv, id)));
+  const list =
+    names.length <= 1
+      ? names.join('')
+      : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  switch (sys.type) {
+    case 'member_added':
+      return `${actor} added ${list || 'someone'}`;
+    case 'member_left':
+      return `${actor} left the group`;
+    case 'renamed':
+      return sys.title ? `${actor} named the group “${sys.title}”` : `${actor} renamed the group`;
+    default:
+      return `${actor} changed the group`;
+  }
+}
+
+/** One-line description of a message for previews, quotes and announcements. */
+export function messageSummary(conv, msg) {
+  if (!msg) return '';
+  if (msg.system) return systemText(conv, msg);
+  if (msg.deletedAt) return 'This message was unsent';
+  const body = (msg.body || '').replace(/\s+/g, ' ').trim();
+  if (body) return body;
+  if (msg.attachment) return kindLabel(attachmentKind(msg.attachment));
+  if (msg.attachmentKind) return kindLabel(msg.attachmentKind);
+  return '';
 }
 
 export function sortedMessages(convId) {
