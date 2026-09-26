@@ -9,9 +9,20 @@ const { PushService, loadVapidKeys } = require('./push');
 const { createStaticHandler } = require('./static');
 const { createHttpHandler } = require('./http');
 const { RateLimiter } = require('./auth');
-const { SmsService, resolveSmsConfig, smsOptionsFromEnv } = require('./sms');
+const { MediaSweeper } = require('./media');
 
 const DEFAULT_PUBLIC_DIR = path.join(__dirname, '..', 'public');
+
+/** A non-negative number from an option or env string, else `fallback` (with a warning if it was garbage). */
+function positiveNumber(value, fallback, name, log) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isFinite(n) || n < 0) {
+    log.warn(`${name} must be a number >= 0; using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
 
 /**
  * Starts TealTalk.
@@ -27,10 +38,12 @@ const DEFAULT_PUBLIC_DIR = path.join(__dirname, '..', 'public');
  * @param {string} [options.vapidSubject]
  * @param {boolean} [options.trustProxy] use the last X-Forwarded-For hop as the client IP
  * @param {object} [options.log]        console-like logger
- * @param {object|null} [options.sms]   texting via Twilio: { accountSid, authToken, numbers: { "+1555...": "username" }
- *                                      (or the SMS_NUMBERS string), publicUrl, apiBase?, defaultCountryCode?, retryDelaysMs? }.
- *                                      Omitted: read from the environment. null: off.
  * @param {string|null} [options.signupCode] required on register when set. Omitted: SIGNUP_CODE from the environment.
+ * @param {number} [options.maxUploadMb] largest photo/video/voice file. Omitted: MAX_UPLOAD_MB (default 250).
+ * @param {number} [options.mediaRetentionDays] delete media older than this (0 = keep forever).
+ *                                      Omitted: MEDIA_RETENTION_DAYS (default 0).
+ * @param {number} [options.sweepIntervalMs] how often expired media and abandoned uploads are cleaned (default 1 hour)
+ * @param {() => number} [options.now]  clock in ms (tests); defaults to Date.now
  * @returns {Promise<{url:string, port:number, close:() => Promise<void>}>}
  */
 async function createApp(options = {}) {
@@ -40,12 +53,13 @@ async function createApp(options = {}) {
   const log = options.log || console;
   const uploadsDir = path.join(dataDir, 'uploads');
   fs.mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
-  // Remove half-written uploads from a previous run.
-  for (const name of fs.readdirSync(uploadsDir)) {
-    if (name.startsWith('.tmp-')) fs.rmSync(path.join(uploadsDir, name), { force: true });
-  }
-
   const store = new Store(path.join(dataDir, 'tealtalk.db'));
+  // Remove half-written single-request uploads from a previous run, and resumable-upload files
+  // whose upload no longer exists.
+  for (const name of fs.readdirSync(uploadsDir)) {
+    const orphanPart = name.startsWith('.part-') && !store.getUpload(name.slice('.part-'.length));
+    if (name.startsWith('.tmp-') || orphanPart) fs.rmSync(path.join(uploadsDir, name), { force: true });
+  }
   const vapid = loadVapidKeys(dataDir);
   const hub = new Hub({ store, heartbeatMs: options.heartbeatMs || 30000, log });
   const push = new PushService({
@@ -57,29 +71,50 @@ async function createApp(options = {}) {
     log,
   });
   const rateLimiter = new RateLimiter(options.rateLimit || { max: 20, windowMs: 10 * 60 * 1000 });
-  const smsConfig = resolveSmsConfig(options.sms === undefined ? smsOptionsFromEnv(process.env) : options.sms);
-  const sms = new SmsService({ config: smsConfig, store, hub, push, uploadsDir, log });
+  const now = typeof options.now === 'function' ? options.now : Date.now;
   const rawSignupCode = options.signupCode === undefined ? process.env.SIGNUP_CODE : options.signupCode;
   const signupCode = typeof rawSignupCode === 'string' && rawSignupCode.trim() ? rawSignupCode.trim() : null;
-  for (const problem of smsConfig.problems) log.warn(`SMS config: ${problem}`);
-  log.info(sms.describe());
+  const maxUploadMb = positiveNumber(options.maxUploadMb ?? process.env.MAX_UPLOAD_MB, 250, 'MAX_UPLOAD_MB', log) || 250;
+  const retentionDays = positiveNumber(
+    options.mediaRetentionDays ?? process.env.MEDIA_RETENTION_DAYS,
+    0,
+    'MEDIA_RETENTION_DAYS',
+    log
+  );
   log.info(signupCode ? 'Signup requires a signup code' : 'Signup is open to anyone (set SIGNUP_CODE to require a code)');
+  log.info(
+    retentionDays > 0
+      ? `Photos, videos and voice messages are deleted from the server after ${retentionDays} days`
+      : 'Photos, videos and voice messages are kept forever (set MEDIA_RETENTION_DAYS to limit storage)'
+  );
+  const sweeper = new MediaSweeper({
+    store,
+    uploadsDir,
+    retentionDays,
+    intervalMs: options.sweepIntervalMs || 60 * 60 * 1000,
+    now,
+    log,
+  });
+  // The first sweep runs right after start, then every sweepIntervalMs.
+  setImmediate(() => sweeper.sweep());
   const handler = createHttpHandler({
     store,
     hub,
     push,
-    sms,
     signupCode,
     staticHandler: createStaticHandler(options.publicDir || DEFAULT_PUBLIC_DIR),
     uploadsDir,
     rateLimiter,
     trustProxy: options.trustProxy ?? process.env.TRUST_PROXY === '1',
+    maxUploadBytes: Math.floor(maxUploadMb * 1024 * 1024),
+    now,
     log,
   });
 
   const server = http.createServer(handler);
   server.headersTimeout = 30000;
-  server.requestTimeout = 120000;
+  // Long enough for a 10 MB photo or a 5 MB upload chunk on a slow phone connection.
+  server.requestTimeout = 300000;
   server.keepAliveTimeout = 5000;
   server.on('upgrade', (req, socket, head) => hub.handleUpgrade(req, socket, head));
   server.on('clientError', (err, socket) => {
@@ -96,7 +131,7 @@ async function createApp(options = {}) {
       });
     });
   } catch (err) {
-    sms.close();
+    sweeper.close();
     await hub.close();
     rateLimiter.close();
     store.close();
@@ -114,12 +149,12 @@ async function createApp(options = {}) {
     store,
     hub,
     push,
-    sms,
+    sweeper,
     close() {
       if (!closing) {
         closing = (async () => {
           push.close();
-          sms.close();
+          sweeper.close();
           rateLimiter.close();
           await hub.close();
           await new Promise((resolve) => {

@@ -50,9 +50,15 @@ function validateSubscription(sub) {
   return { endpoint, keys: { p256dh, auth } };
 }
 
-function preview(body, hasAttachment) {
+const KIND_PREVIEW = { image: 'Photo', video: 'Video', audio: 'Voice message' };
+
+/** Notification text: the message, else what was attached (`attachment` is an Attachment or `true` for a photo). */
+function preview(body, attachment) {
   const text = (body || '').replace(/\s+/g, ' ').trim();
-  if (!text) return hasAttachment ? 'Photo' : '';
+  if (!text) {
+    if (!attachment) return '';
+    return KIND_PREVIEW[attachment.kind] || 'Photo';
+  }
   const chars = Array.from(text);
   if (chars.length <= 100) return text;
   return chars.slice(0, 99).join('') + '…';
@@ -93,25 +99,20 @@ class PushService {
   }
 
   /**
-   * Fire-and-forget: pushes a new message to every other member without an open socket.
-   * `sender` is null for texts from outside phone numbers; pass `{ title }` for those.
+   * Fire-and-forget: pushes a brand-new message to every other member without an open socket.
    * Never throws and never delays the caller.
    */
-  notifyMessage(message, conversationRow, sender, memberIds, { title: titleOverride } = {}) {
+  notifyMessage(message, conversationRow, sender, memberIds) {
     if (this.closed) return;
     setImmediate(() => {
       if (this.closed) return;
       try {
-        // sender is null for a text from an outside phone number (then titleOverride names it).
-        const senderId = sender ? sender.id : null;
-        const recipients = memberIds.filter((id) => id !== senderId && !this.hub.isOnline(id));
+        const recipients = memberIds.filter((id) => id !== sender.id && !this.hub.isOnline(id));
         if (!recipients.length) return;
-        const title =
-          titleOverride ||
-          (conversationRow.is_group && conversationRow.title ? conversationRow.title : sender ? sender.displayName : 'TealTalk');
+        const title = conversationRow.is_group && conversationRow.title ? conversationRow.title : sender.displayName;
         const payload = JSON.stringify({
           title,
-          body: preview(message.body, !!message.attachment),
+          body: preview(message.body, message.attachment),
           conversationId: message.conversationId,
         });
         for (const userId of recipients) {

@@ -208,7 +208,11 @@ Conversations are still returned as before; `sms` fields no longer exist. `GET /
 | `GET /api/uploads/:id` | - | `{ received, size }` |
 | `POST /api/uploads/:id/complete` | `{ width?, height?, durationMs?, thumbnailId? }` | `201 { attachment }` once `received == size` (else `409`). Magic-byte check happens here. |
 
-Only the uploader can touch an upload. Unfinished uploads are deleted after 24 h.
+| `DELETE /api/uploads/:id` | - | `204`: cancel and free the upload |
+
+Only the uploader can touch an upload (`403` otherwise). A chunk over `chunkSize` gets `413`; an empty chunk or one past the end gets `400`; a second chunk sent while one is still arriving gets `409 { received }`. Bad metadata at `complete` gets `400`, and the upload can be completed again. A magic-byte mismatch at `complete` gets `415`, and the upload is deleted. Each person can have 5 unfinished uploads: starting a 6th replaces their oldest idle one, and it's `429` only if all 5 are receiving right now. Unfinished uploads are deleted 24 h after they started.
+- A file can be attached to only one message (`400` on reuse). A thumbnail must be one of the sender's own images, and voice messages don't take one.
+- An expired attachment returns `410`. After unsend, the attachment and its thumbnail are gone (`404`).
 - `GET /api/attachments/:id` supports **HTTP Range requests** (`Accept-Ranges: bytes`, `206`, `416`). iPhone Safari won't play video without it. Same permission rules as before. `thumbnailId` attachments follow the permissions of the attachment that references them.
 
 ### Client rules for media
@@ -217,6 +221,10 @@ Only the uploader can touch an upload. Unfinished uploads are deleted after 24 h
 - **Videos go as the original file** with a poster thumbnail grabbed from an early frame. They play inline (`<video playsinline controls preload="metadata">`). If `video.canPlayType(mime)` says the device can't play it (e.g. an iPhone HEVC `.mov` on an older Android), show the poster plus a clear "Download to watch" link instead of a broken player.
 - **Voice messages**: hold or tap the mic (`record-button`) and record with MediaRecorder, **preferring `audio/mp4` (AAC)** because it plays on both iPhone and Android. Fall back to `audio/webm;codecs=opus` only if mp4 recording isn't supported. Show a player with duration.
 - Uploads show progress (`upload-progress`), survive a dropped connection (resume via `GET /api/uploads/:id`) and can be cancelled.
+
+### Security headers (v2)
+
+The CSP adds `media-src 'self' blob:` so videos, voice messages and local previews play. `Permissions-Policy` allows `microphone=(self)` for voice messages, and camera, geolocation etc. stay off.
 
 ### Reactions, replies, edit, unsend
 
@@ -228,13 +236,13 @@ Only the uploader can touch an upload. Unfinished uploads are deleted after 24 h
 | `PATCH /api/conversations/:id/messages/:msgId` | `{ body }` | `200 { message }`. Sender only (`403`), text messages only, within **15 minutes** of sending (`409` after), not system/deleted |
 | `DELETE /api/conversations/:id/messages/:msgId` | - | `200 { message }` (unsent). Sender only, within **24 hours**. Deletes the file(s) from disk too. Replies quoting it show `replyTo.deleted: true` |
 
-You can't react to, reply to or edit unsent or system messages (`400`).
+You can't react to, reply to or edit unsent or system messages (`400`). A reply's `replyTo` quote is looked up live: when the original is edited or unsent, the replies are re-sent as `message` events with the updated quote.
 
 ### Groups
 
 | Method & path | Body | Response |
 | --- | --- | --- |
-| `PATCH /api/conversations/:id` | `{ title }` | groups only (1-80 chars; `400` for 1:1 or empty). Adds a `renamed` system message |
+| `PATCH /api/conversations/:id` | `{ title }` | groups only (1-80 chars; `400` for 1:1 or empty). Adds a `renamed` system message (`userIds: []`, `title` set; `title` is null for the other system types). Renaming to the same title adds nothing |
 | `POST /api/conversations/:id/members` | `{ userIds: [...] }` | groups only, any member can add; `200 { conversation }`. Adds a `member_added` system message. New members see history from when they joined onward (messages before `joinedAfterMessageId` are hidden from them) |
 | `DELETE /api/conversations/:id/members/me` | - | leave a group (`204`). Adds a `member_left` system message. The conversation disappears from my list; I get a `conversation_removed` WS event `{ conversationId }` |
 

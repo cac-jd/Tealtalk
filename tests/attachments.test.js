@@ -11,6 +11,13 @@ function upload(app, token, bytes, type = 'image/png') {
   return request(app, 'POST', '/api/attachments', { token, raw: bytes, headers: { 'Content-Type': type } });
 }
 
+/** `head` followed by filler bytes up to `size`. */
+function padded(head, size) {
+  const buf = Buffer.alloc(size, 1);
+  head.copy(buf);
+  return buf;
+}
+
 describe('attachments', () => {
   let app;
   let alice;
@@ -43,9 +50,9 @@ describe('attachments', () => {
       assert.equal((await upload(app, alice.token, PNG_BYTES, type)).status, 415, type);
     }
     assert.equal((await upload(app, alice.token, Buffer.alloc(0))).status, 400);
-    const exact = await upload(app, alice.token, Buffer.alloc(10 * 1024 * 1024, 1));
+    const exact = await upload(app, alice.token, padded(PNG_BYTES, 10 * 1024 * 1024));
     assert.equal(exact.status, 201);
-    const tooBig = await upload(app, alice.token, Buffer.alloc(10 * 1024 * 1024 + 1, 1));
+    const tooBig = await upload(app, alice.token, padded(PNG_BYTES, 10 * 1024 * 1024 + 1));
     assert.equal(tooBig.status, 413);
     // No leftover temp files.
     const leftovers = fs.readdirSync(path.join(app.dataDir, 'uploads')).filter((n) => n.startsWith('.tmp'));
@@ -106,7 +113,18 @@ describe('attachments', () => {
 
     const msg = await send(app, alice, c.id, '', { attachmentId: att.id });
     assert.equal(msg.body, '');
-    assert.deepEqual(msg.attachment, { id: att.id, mime: 'image/png', size: PNG_BYTES.length });
+    assert.deepEqual(msg.attachment, {
+      id: att.id,
+      mime: 'image/png',
+      size: PNG_BYTES.length,
+      kind: 'image',
+      width: null,
+      height: null,
+      durationMs: null,
+      thumbnailId: null,
+      expired: false,
+    });
+    assert.deepEqual(msg.attachment, att);
 
     const res = await fetch(`${app.url}/api/attachments/${att.id}?token=${encodeURIComponent(bob.token)}`);
     assert.equal(res.status, 200);

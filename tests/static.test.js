@@ -9,7 +9,7 @@ const net = require('node:net');
 const { startApp, request } = require('./helpers');
 
 const EXPECTED_CSP =
-  "default-src 'self'; img-src 'self' blob: data:; connect-src 'self' ws: wss:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+  "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' ws: wss:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 /** Sends a raw request line so the path is not normalized by a URL parser. */
 function rawGet(app, target) {
@@ -150,7 +150,10 @@ describe('static files', () => {
       assert.equal(res.headers.get('content-security-policy'), EXPECTED_CSP, res.url);
       assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
       assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
-      assert.ok(res.headers.get('permissions-policy'));
+      assert.equal(
+        res.headers.get('permissions-policy'),
+        'camera=(), microphone=(self), geolocation=(), payment=(), usb=()'
+      );
       await res.arrayBuffer();
     }
   });

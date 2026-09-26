@@ -17,9 +17,10 @@ async function startApp(opts = {}) {
     port: 0,
     rateLimit: { max: 10000, windowMs: 60000 },
     log: quietLog,
-    // Hermetic by default: ignore TWILIO_*/SMS_*/SIGNUP_CODE from the environment.
-    sms: null,
+    // Hermetic by default: ignore SIGNUP_CODE, MAX_UPLOAD_MB and MEDIA_RETENTION_DAYS from the environment.
     signupCode: null,
+    maxUploadMb: 250,
+    mediaRetentionDays: 0,
     ...opts,
     dataDir,
   });
@@ -176,4 +177,75 @@ const PNG_BYTES = Buffer.from(
   'base64'
 );
 
-module.exports = { startApp, request, register, dm, send, uniqueName, WsClient, sleep, PNG_BYTES, quietLog };
+// The first bytes of each accepted format (what the server's magic-number check looks at).
+const MEDIA_HEADS = {
+  jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]),
+  png: PNG_BYTES.subarray(0, 16),
+  gif87: Buffer.from('GIF87a\x01\x00\x01\x00', 'latin1'),
+  gif89: Buffer.from('GIF89a\x01\x00\x01\x00', 'latin1'),
+  webp: Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]), Buffer.from('WEBPVP8 ')]),
+  mp4: Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom'), Buffer.from([0, 0, 2, 0]), Buffer.from('isommp41')]),
+  mov: Buffer.concat([Buffer.from([0, 0, 0, 0x14]), Buffer.from('ftypqt  '), Buffer.from([0, 0, 2, 0]), Buffer.from('qt  ')]),
+  m4a: Buffer.concat([Buffer.from([0, 0, 0, 0x1c]), Buffer.from('ftypM4A '), Buffer.from([0, 0, 0, 0]), Buffer.from('M4A mp42isom')]),
+  webm: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0xf7, 0x81]),
+  ogg: Buffer.concat([Buffer.from('OggS'), Buffer.from([0, 2, 0, 0, 0, 0, 0, 0, 0, 0])]),
+  id3: Buffer.concat([Buffer.from('ID3'), Buffer.from([4, 0, 0, 0, 0, 0, 0])]),
+  mp3: Buffer.from([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]),
+  aac: Buffer.from([0xff, 0xf1, 0x50, 0x80, 0x02, 0x1f, 0xfc]),
+  aacCrc: Buffer.from([0xff, 0xf9, 0x50, 0x80, 0x02, 0x1f, 0xfc]),
+};
+
+/** A fake media file: `head` then filler bytes, `size` bytes long in total. */
+function mediaFile(head, size = 256) {
+  const buf = Buffer.alloc(Math.max(size, head.length), 0x5a);
+  head.copy(buf);
+  return buf;
+}
+
+/** Uploads a small file in one request; returns the response. */
+function uploadSmall(app, who, bytes, mime, query = '') {
+  return request(app, 'POST', `/api/attachments${query}`, {
+    token: who.token,
+    raw: bytes,
+    headers: { 'Content-Type': mime },
+  });
+}
+
+/** Uploads and returns the attachment, failing loudly otherwise. */
+async function uploadOk(app, who, bytes = PNG_BYTES, mime = 'image/png', query = '') {
+  const res = await uploadSmall(app, who, bytes, mime, query);
+  if (res.status !== 201) throw new Error(`upload failed ${res.status} ${res.text}`);
+  return res.body.attachment;
+}
+
+/** A controllable clock for createApp({ now }). */
+function fakeClock(start = Date.now()) {
+  let t = start;
+  const now = () => t;
+  now.advance = (ms) => {
+    t += ms;
+    return t;
+  };
+  now.set = (value) => {
+    t = value;
+  };
+  return now;
+}
+
+module.exports = {
+  startApp,
+  request,
+  register,
+  dm,
+  send,
+  uniqueName,
+  WsClient,
+  sleep,
+  PNG_BYTES,
+  MEDIA_HEADS,
+  mediaFile,
+  uploadSmall,
+  uploadOk,
+  fakeClock,
+  quietLog,
+};

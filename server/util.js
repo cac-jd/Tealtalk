@@ -4,10 +4,12 @@ const crypto = require('node:crypto');
 
 /** An error that maps directly onto an HTTP status and a safe, human readable message. */
 class HttpError extends Error {
-  constructor(status, message, headers) {
+  /** `fields` are extra JSON fields sent next to `error` (e.g. `{ received }` on an upload 409). */
+  constructor(status, message, headers, fields) {
     super(message);
     this.status = status;
     this.headers = headers || null;
+    this.fields = fields || null;
   }
 }
 
@@ -18,6 +20,7 @@ function newId(prefix) {
 const CSP = [
   "default-src 'self'",
   "img-src 'self' blob: data:",
+  "media-src 'self' blob:",
   "connect-src 'self' ws: wss:",
   "style-src 'self'",
   "script-src 'self'",
@@ -30,7 +33,7 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy': CSP,
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+  'Permissions-Policy': 'camera=(), microphone=(self), geolocation=(), payment=(), usb=()',
   'X-Frame-Options': 'DENY',
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Resource-Policy': 'same-origin',
@@ -107,19 +110,6 @@ async function readJson(req, limit) {
   return value;
 }
 
-/**
- * Read an application/x-www-form-urlencoded body (e.g. a Twilio webhook), enforcing a byte limit.
- * Returns the decoded [name, value] pairs in their original order (415 for other content types).
- */
-async function readForm(req, limit) {
-  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-  if (type !== 'application/x-www-form-urlencoded') {
-    throw new HttpError(415, 'Expected application/x-www-form-urlencoded');
-  }
-  const buf = await readBody(req, limit);
-  return [...new URLSearchParams(buf.toString('utf8'))];
-}
-
 /** Split a raw request target into a pathname and URLSearchParams without letting `//host` be parsed as authority. */
 function parseTarget(rawUrl) {
   const url = typeof rawUrl === 'string' ? rawUrl : '/';
@@ -146,7 +136,6 @@ module.exports = {
   sendEmpty,
   readBody,
   readJson,
-  readForm,
   parseTarget,
   hasControlChars,
 };

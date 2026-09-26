@@ -109,7 +109,7 @@ describe('auth', () => {
     assert.equal((await request(app, 'GET', '/api/me', { headers: { Authorization: 'Basic abc' } })).status, 401);
     const me = await request(app, 'GET', '/api/me', { token });
     assert.equal(me.status, 200);
-    assert.deepEqual(me.body.user, user);
+    assert.deepEqual(me.body, { user }); // no sms field any more
     // Query-string tokens are only for WS and attachments.
     assert.equal((await request(app, 'GET', `/api/me?token=${token}`)).status, 401);
   });
@@ -204,5 +204,54 @@ describe('rate limiting', () => {
     // Other endpoints are not affected.
     assert.equal((await request(app, 'GET', '/api/health')).status, 200);
     statuses = null;
+  });
+});
+
+describe('signup code', () => {
+  let app;
+  before(async () => {
+    app = await startApp({ signupCode: 'teal-2026' });
+  });
+  after(() => app.close());
+
+  test('register requires the right code', async () => {
+    const base = { username: uniqueName('code'), password: 'correct horse battery' };
+    for (const signupCode of [undefined, '', 'nope', 'TEAL-2026', 42, 'teal-2026x']) {
+      const res = await request(app, 'POST', '/api/register', { body: { ...base, signupCode } });
+      assert.equal(res.status, 403, String(signupCode));
+      assert.deepEqual(res.body, { error: "That signup code isn't right." });
+    }
+    assert.equal(app.store.usernameExists(base.username), false);
+    const ok = await request(app, 'POST', '/api/register', { body: { ...base, signupCode: ' teal-2026 ' } });
+    assert.equal(ok.status, 201);
+    // Login never needs it.
+    const login = await request(app, 'POST', '/api/login', { body: base });
+    assert.equal(login.status, 200);
+  });
+
+  test('SIGNUP_CODE is read from the environment; blank means open signup', async () => {
+    const saved = process.env.SIGNUP_CODE;
+    try {
+      process.env.SIGNUP_CODE = ' from-env ';
+      const gated = await startApp({ signupCode: undefined });
+      try {
+        const body = { username: uniqueName('env'), password: 'correct horse battery' };
+        assert.equal((await request(gated, 'POST', '/api/register', { body })).status, 403);
+        assert.equal((await request(gated, 'POST', '/api/register', { body: { ...body, signupCode: 'from-env' } })).status, 201);
+      } finally {
+        await gated.close();
+      }
+      process.env.SIGNUP_CODE = '   ';
+      const open = await startApp({ signupCode: undefined });
+      try {
+        const body = { username: uniqueName('open'), password: 'correct horse battery' };
+        assert.equal((await request(open, 'POST', '/api/register', { body })).status, 201);
+      } finally {
+        await open.close();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.SIGNUP_CODE;
+      else process.env.SIGNUP_CODE = saved;
+    }
   });
 });
