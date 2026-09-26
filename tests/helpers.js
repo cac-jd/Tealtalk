@@ -17,6 +17,9 @@ async function startApp(opts = {}) {
     port: 0,
     rateLimit: { max: 10000, windowMs: 60000 },
     log: quietLog,
+    // Hermetic by default: ignore TWILIO_*/SMS_*/SIGNUP_CODE from the environment.
+    sms: null,
+    signupCode: null,
     ...opts,
     dataDir,
   });

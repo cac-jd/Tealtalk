@@ -94,16 +94,21 @@ class PushService {
 
   /**
    * Fire-and-forget: pushes a new message to every other member without an open socket.
+   * `sender` is null for texts from outside phone numbers; pass `{ title }` for those.
    * Never throws and never delays the caller.
    */
-  notifyMessage(message, conversationRow, sender, memberIds) {
+  notifyMessage(message, conversationRow, sender, memberIds, { title: titleOverride } = {}) {
     if (this.closed) return;
     setImmediate(() => {
       if (this.closed) return;
       try {
-        const recipients = memberIds.filter((id) => id !== sender.id && !this.hub.isOnline(id));
+        // sender is null for a text from an outside phone number (then titleOverride names it).
+        const senderId = sender ? sender.id : null;
+        const recipients = memberIds.filter((id) => id !== senderId && !this.hub.isOnline(id));
         if (!recipients.length) return;
-        const title = conversationRow.is_group && conversationRow.title ? conversationRow.title : sender.displayName;
+        const title =
+          titleOverride ||
+          (conversationRow.is_group && conversationRow.title ? conversationRow.title : sender ? sender.displayName : 'TealTalk');
         const payload = JSON.stringify({
           title,
           body: preview(message.body, !!message.attachment),

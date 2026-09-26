@@ -186,6 +186,8 @@ TealTalk can text phone numbers that don't use TealTalk. It goes through a Twili
 
 - Phone numbers are stored and returned in E.164 (`+15551234567`). Short codes (5-6 digits) from inbound texts are kept as the digits.
 - An SMS conversation's `title` is the contact name the owner gave it (null = show the formatted number).
+- Inbound attachments that aren't images (vCards, video) aren't downloaded. The message gets a note instead, e.g. `[1 attachment TealTalk can't show]`.
+- If a user is removed from `SMS_NUMBERS`, they can still read their old SMS conversations, but posting to them returns `403`.
 - There is one SMS conversation per (owning user, phone number). SMS conversations are always 1:1. Twilio can't do group texts.
 
 ### HTTP API additions
@@ -195,7 +197,7 @@ TealTalk can text phone numbers that don't use TealTalk. It goes through a Twili
 | `GET /api/me` | - | `{ user, sms: { enabled: bool, number: "+1555..." or null } }`: `enabled` means *this* user can text phone numbers |
 | `POST /api/sms/conversations` | `{ phone, title? }` | `201 { conversation }`, or `200` with the existing one. `400` on an invalid number, `403` if this user has no SMS number |
 | `PATCH /api/conversations/:id` | `{ title }` | `{ conversation }`. Any member can rename a group or an SMS contact (1-80 chars; `null`/`""` clears it on SMS contacts). `400` for 1:1 TealTalk chats. Sends a `conversation` WS event. |
-| `POST /api/conversations/:id/messages` | same as before | for SMS conversations the message is saved with `sms.status: "queued"`, then sent via Twilio asynchronously. The HTTP response doesn't wait for Twilio. Status changes go out as `message` WS events carrying the updated message (same id; clients replace it). |
+| `POST /api/conversations/:id/messages` | same as before, but the body is max 1600 chars in SMS conversations (Twilio's limit) | for SMS conversations the message is saved with `sms.status: "queued"`, then sent via Twilio asynchronously. The HTTP response doesn't wait for Twilio. Status changes go out as `message` WS events carrying the updated message (same id; clients replace it). |
 | `POST /api/sms/twilio` | Twilio form post | incoming text webhook. Checks `X-Twilio-Signature` against `PUBLIC_URL + "/api/sms/twilio"` (`403` if bad). `To` must be in `SMS_NUMBERS`. Finds or creates the conversation, saves the message with `senderId: null`, `sms.status: "received"`, downloads `MediaUrl0..9` images (jpeg/png/gif/webp, max 10 MB, with Basic auth) as attachments (one message per extra image), then does the usual WS fan-out and push. Replies with `200 text/xml` `<Response></Response>`. Deduplicates on `MessageSid`. |
 | `POST /api/sms/twilio/status` | Twilio form post | delivery status callback (same signature check; the URL passed as `StatusCallback` is `PUBLIC_URL + "/api/sms/twilio/status"`). Maps `MessageStatus` onto `sms.status`: queued/accepted/sending -> `queued`, sent -> `sent`, delivered -> `delivered`, failed/undelivered -> `failed` with a readable `error` from `ErrorCode` (e.g. 21610 -> "This number has opted out (they replied STOP)", 30003/30005/30006 -> "Couldn't be delivered to this number"). Status only moves forward, except to `failed`. |
 | `GET /api/sms/media/:attachmentId?exp=&sig=` | - | lets Twilio fetch an outgoing photo. `sig` = HMAC-SHA256(auth token, `attachmentId + "." + exp`) as base64url, and the link expires 1 hour after `exp` is issued. No login needed. |

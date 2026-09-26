@@ -9,6 +9,7 @@ const { PushService, loadVapidKeys } = require('./push');
 const { createStaticHandler } = require('./static');
 const { createHttpHandler } = require('./http');
 const { RateLimiter } = require('./auth');
+const { SmsService, resolveSmsConfig, smsOptionsFromEnv } = require('./sms');
 
 const DEFAULT_PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
@@ -26,6 +27,10 @@ const DEFAULT_PUBLIC_DIR = path.join(__dirname, '..', 'public');
  * @param {string} [options.vapidSubject]
  * @param {boolean} [options.trustProxy] use the last X-Forwarded-For hop as the client IP
  * @param {object} [options.log]        console-like logger
+ * @param {object|null} [options.sms]   texting via Twilio: { accountSid, authToken, numbers: { "+1555...": "username" }
+ *                                      (or the SMS_NUMBERS string), publicUrl, apiBase?, defaultCountryCode?, retryDelaysMs? }.
+ *                                      Omitted: read from the environment. null: off.
+ * @param {string|null} [options.signupCode] required on register when set. Omitted: SIGNUP_CODE from the environment.
  * @returns {Promise<{url:string, port:number, close:() => Promise<void>}>}
  */
 async function createApp(options = {}) {
@@ -52,10 +57,19 @@ async function createApp(options = {}) {
     log,
   });
   const rateLimiter = new RateLimiter(options.rateLimit || { max: 20, windowMs: 10 * 60 * 1000 });
+  const smsConfig = resolveSmsConfig(options.sms === undefined ? smsOptionsFromEnv(process.env) : options.sms);
+  const sms = new SmsService({ config: smsConfig, store, hub, push, uploadsDir, log });
+  const rawSignupCode = options.signupCode === undefined ? process.env.SIGNUP_CODE : options.signupCode;
+  const signupCode = typeof rawSignupCode === 'string' && rawSignupCode.trim() ? rawSignupCode.trim() : null;
+  for (const problem of smsConfig.problems) log.warn(`SMS config: ${problem}`);
+  log.info(sms.describe());
+  log.info(signupCode ? 'Signup requires a signup code' : 'Signup is open to anyone (set SIGNUP_CODE to require a code)');
   const handler = createHttpHandler({
     store,
     hub,
     push,
+    sms,
+    signupCode,
     staticHandler: createStaticHandler(options.publicDir || DEFAULT_PUBLIC_DIR),
     uploadsDir,
     rateLimiter,
@@ -82,6 +96,7 @@ async function createApp(options = {}) {
       });
     });
   } catch (err) {
+    sms.close();
     await hub.close();
     rateLimiter.close();
     store.close();
@@ -99,10 +114,12 @@ async function createApp(options = {}) {
     store,
     hub,
     push,
+    sms,
     close() {
       if (!closing) {
         closing = (async () => {
           push.close();
+          sms.close();
           rateLimiter.close();
           await hub.close();
           await new Promise((resolve) => {

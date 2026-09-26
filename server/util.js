@@ -56,8 +56,8 @@ function sendEmpty(res, status = 204) {
   res.end();
 }
 
-/** Read and parse a JSON object body, enforcing a byte limit. An empty body parses as {}. */
-function readJson(req, limit) {
+/** Read a whole request body into a Buffer, enforcing a byte limit (413 when exceeded). */
+function readBody(req, limit) {
   return new Promise((resolve, reject) => {
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > limit) {
@@ -84,26 +84,40 @@ function readJson(req, limit) {
     req.on('end', () => {
       if (done) return;
       done = true;
-      if (size === 0) {
-        resolve({});
-        return;
-      }
-      let value;
-      try {
-        value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      } catch {
-        reject(new HttpError(400, 'Invalid JSON body'));
-        return;
-      }
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        reject(new HttpError(400, 'Body must be a JSON object'));
-        return;
-      }
-      resolve(value);
+      resolve(Buffer.concat(chunks, size));
     });
     req.on('error', () => fail(new HttpError(400, 'Bad request')));
     req.on('aborted', () => fail(new HttpError(400, 'Request aborted')));
   });
+}
+
+/** Read and parse a JSON object body, enforcing a byte limit. An empty body parses as {}. */
+async function readJson(req, limit) {
+  const buf = await readBody(req, limit);
+  if (buf.length === 0) return {};
+  let value;
+  try {
+    value = JSON.parse(buf.toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'Invalid JSON body');
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new HttpError(400, 'Body must be a JSON object');
+  }
+  return value;
+}
+
+/**
+ * Read an application/x-www-form-urlencoded body (e.g. a Twilio webhook), enforcing a byte limit.
+ * Returns the decoded [name, value] pairs in their original order (415 for other content types).
+ */
+async function readForm(req, limit) {
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (type !== 'application/x-www-form-urlencoded') {
+    throw new HttpError(415, 'Expected application/x-www-form-urlencoded');
+  }
+  const buf = await readBody(req, limit);
+  return [...new URLSearchParams(buf.toString('utf8'))];
 }
 
 /** Split a raw request target into a pathname and URLSearchParams without letting `//host` be parsed as authority. */
@@ -130,7 +144,9 @@ module.exports = {
   setSecurityHeaders,
   sendJson,
   sendEmpty,
+  readBody,
   readJson,
+  readForm,
   parseTarget,
   hasControlChars,
 };

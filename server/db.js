@@ -2,7 +2,9 @@
 
 const { DatabaseSync } = require('node:sqlite');
 
-const SCHEMA = `
+// Version 1: the original schema. Kept verbatim (CREATE ... IF NOT EXISTS) so that databases
+// created before `user_version` was tracked (they report version 0) pass through it unchanged.
+const SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
   username      TEXT NOT NULL UNIQUE,
@@ -69,9 +71,54 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE INDEX IF NOT EXISTS push_user ON push_subscriptions(user_id);
 `;
 
+// Version 2: texting phone numbers (SMS/MMS via Twilio).
+// - messages.sender_id becomes nullable (null = sent by the outside phone number). SQLite can't drop
+//   NOT NULL in place, so the table is rebuilt (https://sqlite.org/lang_altertable.html#otheralter).
+// - messages gain the SMS delivery status/error and the Twilio message sid.
+// - conversations gain the phone number and owning user of a text-message conversation.
+// - sms_inbound remembers Twilio MessageSids already processed, so retried webhooks are ignored.
+const MIGRATE_V2 = `
+CREATE TABLE messages_v2 (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  sender_id       TEXT REFERENCES users(id),
+  client_id       TEXT NOT NULL,
+  body            TEXT NOT NULL,
+  attachment_id   TEXT REFERENCES attachments(id),
+  created_at      INTEGER NOT NULL,
+  sms_status      TEXT,
+  sms_error       TEXT,
+  sms_sid         TEXT,
+  UNIQUE (sender_id, client_id)
+);
+INSERT INTO messages_v2 (id, conversation_id, sender_id, client_id, body, attachment_id, created_at)
+  SELECT id, conversation_id, sender_id, client_id, body, attachment_id, created_at FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_v2 RENAME TO messages;
+CREATE INDEX messages_conv ON messages(conversation_id, id);
+CREATE INDEX messages_attachment ON messages(attachment_id);
+CREATE UNIQUE INDEX messages_sms_sid ON messages(sms_sid) WHERE sms_sid IS NOT NULL;
+
+ALTER TABLE conversations ADD COLUMN sms_phone TEXT;
+ALTER TABLE conversations ADD COLUMN sms_owner_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+CREATE UNIQUE INDEX conversations_sms ON conversations(sms_owner_id, sms_phone) WHERE sms_phone IS NOT NULL;
+
+CREATE TABLE sms_inbound (
+  message_sid TEXT PRIMARY KEY,
+  received_at INTEGER NOT NULL
+);
+`;
+
+/** Ordered migrations; migration i brings the database to `user_version` i + 1. */
+const MIGRATIONS = [
+  { sql: SCHEMA_V1, rebuildsTables: false },
+  { sql: MIGRATE_V2, rebuildsTables: true },
+];
+const SCHEMA_VERSION = MIGRATIONS.length;
+
 const MESSAGE_COLUMNS = `
   m.id, m.conversation_id, m.sender_id, m.client_id, m.body, m.attachment_id, m.created_at,
-  a.mime AS attachment_mime, a.size AS attachment_size`;
+  m.sms_status, m.sms_error, a.mime AS attachment_mime, a.size AS attachment_size`;
 
 function userView(row) {
   return row ? { id: row.id, username: row.username, displayName: row.display_name } : null;
@@ -89,6 +136,7 @@ function messageView(row) {
       ? { id: row.attachment_id, mime: row.attachment_mime, size: row.attachment_size }
       : null,
     createdAt: row.created_at,
+    sms: row.sms_status ? { status: row.sms_status, error: row.sms_error ?? null } : null,
   };
 }
 
@@ -100,9 +148,61 @@ class Store {
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec('PRAGMA busy_timeout = 5000');
-    this.db.exec(SCHEMA);
     this.statements = new Map();
     this.closed = false;
+    try {
+      this.migrate();
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
+  }
+
+  get schemaVersion() {
+    return this.db.prepare('PRAGMA user_version').get().user_version;
+  }
+
+  /**
+   * Brings the database up to SCHEMA_VERSION, one migration per transaction. Migrations that
+   * rebuild a table run with foreign keys off (as SQLite requires; the pragma is a no-op inside a
+   * transaction) and verify `foreign_key_check` before committing.
+   */
+  migrate() {
+    const current = this.schemaVersion;
+    if (current > SCHEMA_VERSION) {
+      throw new Error(`Database schema version ${current} is newer than this TealTalk (${SCHEMA_VERSION}); upgrade TealTalk`);
+    }
+    for (let version = current; version < SCHEMA_VERSION; version++) {
+      const { sql, rebuildsTables } = MIGRATIONS[version];
+      if (rebuildsTables) this.db.exec('PRAGMA foreign_keys = OFF');
+      try {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+          const seqTable = this.db.prepare("SELECT 1 AS x FROM sqlite_master WHERE name = 'sqlite_sequence'").get();
+          const seqBefore = seqTable ? this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'messages'").get() : null;
+          this.db.exec(sql);
+          if (seqBefore) {
+            // Keep message ids increasing past anything ever issued before the rebuild.
+            this.db
+              .prepare("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'messages'")
+              .run(seqBefore.seq);
+          }
+          const problems = this.db.prepare('PRAGMA foreign_key_check').all();
+          if (problems.length) throw new Error(`Migration to version ${version + 1} broke ${problems.length} foreign key(s)`);
+          this.db.exec(`PRAGMA user_version = ${version + 1}`);
+          this.db.exec('COMMIT');
+        } catch (err) {
+          try {
+            this.db.exec('ROLLBACK');
+          } catch {
+            /* ignore */
+          }
+          throw err;
+        }
+      } finally {
+        if (rebuildsTables) this.db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
   }
 
   q(sql) {
@@ -149,6 +249,10 @@ class Store {
 
   getUser(id) {
     return userView(this.q('SELECT id, username, display_name FROM users WHERE id = ?').get(id));
+  }
+
+  getUserByUsername(username) {
+    return userView(this.q('SELECT id, username, display_name FROM users WHERE username = ?').get(username));
   }
 
   getUserAuthByUsername(username) {
@@ -202,16 +306,25 @@ class Store {
     return this.q('SELECT * FROM conversations WHERE dm_key = ?').get(dmKey) || null;
   }
 
-  createConversation({ id, title, isGroup, dmKey, createdBy, memberIds, createdAt }) {
+  findSmsConversation(ownerId, phone) {
+    return this.q('SELECT * FROM conversations WHERE sms_owner_id = ? AND sms_phone = ?').get(ownerId, phone) || null;
+  }
+
+  createConversation({ id, title, isGroup, dmKey, createdBy, memberIds, createdAt, smsPhone = null }) {
     return this.transaction(() => {
       this.q(
-        `INSERT INTO conversations (id, title, is_group, dm_key, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, title, isGroup ? 1 : 0, dmKey, createdBy, createdAt, createdAt);
+        `INSERT INTO conversations (id, title, is_group, dm_key, created_by, created_at, updated_at, sms_phone, sms_owner_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, title, isGroup ? 1 : 0, dmKey, createdBy, createdAt, createdAt, smsPhone, smsPhone ? createdBy : null);
       const ins = this.q('INSERT INTO members (conversation_id, user_id, position) VALUES (?, ?, ?)');
       memberIds.forEach((userId, i) => ins.run(id, userId, i));
       return this.getConversationRow(id);
     });
+  }
+
+  updateConversationTitle(id, title) {
+    this.q('UPDATE conversations SET title = ? WHERE id = ?').run(title, id);
+    return this.getConversationRow(id);
   }
 
   isMember(conversationId, userId) {
@@ -258,7 +371,7 @@ class Store {
     }
     const lastMessage = this.lastMessage(conv.id);
     const unread = this.q(
-      'SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ? AND sender_id <> ? AND id > ?'
+      'SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ? AND sender_id IS NOT ? AND id > ?'
     ).get(conv.id, viewerId, myRead).n;
     return {
       id: conv.id,
@@ -268,6 +381,7 @@ class Store {
       lastMessage,
       unreadCount: unread,
       readUpTo,
+      sms: conv.sms_phone ? { phone: conv.sms_phone } : null,
       createdAt: conv.created_at,
       updatedAt: lastMessage ? lastMessage.createdAt : conv.created_at,
     };
@@ -309,15 +423,57 @@ class Store {
     return rows.reverse().map(messageView);
   }
 
-  insertMessage({ conversationId, senderId, clientId, body, attachmentId, createdAt }) {
+  insertMessage({ conversationId, senderId, clientId, body, attachmentId, createdAt, smsStatus = null }) {
     return this.transaction(() => {
       const info = this.q(
-        `INSERT INTO messages (conversation_id, sender_id, client_id, body, attachment_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(conversationId, senderId, clientId, body, attachmentId, createdAt);
+        `INSERT INTO messages (conversation_id, sender_id, client_id, body, attachment_id, created_at, sms_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(conversationId, senderId, clientId, body, attachmentId, createdAt, smsStatus);
       this.q('UPDATE conversations SET updated_at = ? WHERE id = ?').run(createdAt, conversationId);
       return this.getMessage(Number(info.lastInsertRowid));
     });
+  }
+
+  /** Raw SMS state of a message: { id, conversation_id, sms_status, sms_error, sms_sid } or null. */
+  getMessageSms(id) {
+    return this.q('SELECT id, conversation_id, sms_status, sms_error, sms_sid FROM messages WHERE id = ?').get(id) || null;
+  }
+
+  getMessageIdBySmsSid(sid) {
+    const row = this.q('SELECT id FROM messages WHERE sms_sid = ?').get(sid);
+    return row ? row.id : null;
+  }
+
+  setMessageSmsSid(id, sid) {
+    this.q('UPDATE messages SET sms_sid = ? WHERE id = ?').run(sid, id);
+  }
+
+  setMessageSmsStatus(id, status, error) {
+    this.q('UPDATE messages SET sms_status = ?, sms_error = ? WHERE id = ?').run(status, error, id);
+  }
+
+  /** Records an inbound Twilio MessageSid. Returns false if it was already processed. */
+  claimInboundSms(messageSid) {
+    return this.q('INSERT OR IGNORE INTO sms_inbound (message_sid, received_at) VALUES (?, ?)').run(messageSid, Date.now()).changes > 0;
+  }
+
+  releaseInboundSms(messageSid) {
+    this.q('DELETE FROM sms_inbound WHERE message_sid = ?').run(messageSid);
+  }
+
+  /**
+   * True if the attachment is on a message a TealTalk user sent (and uploaded the photo for)
+   * in their own text-message conversation: the only files Twilio may fetch.
+   */
+  isOutgoingSmsAttachment(attachmentId) {
+    return !!this.q(
+      `SELECT 1 AS x FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       JOIN attachments a ON a.id = m.attachment_id
+       WHERE m.attachment_id = ? AND m.sender_id IS NOT NULL AND m.sender_id = a.uploader_id
+         AND c.sms_phone IS NOT NULL AND c.sms_owner_id = m.sender_id
+       LIMIT 1`
+    ).get(attachmentId);
   }
 
   messageInConversation(messageId, conversationId) {
@@ -391,4 +547,4 @@ class Store {
   }
 }
 
-module.exports = { Store, userView, messageView };
+module.exports = { Store, userView, messageView, SCHEMA_VERSION };

@@ -10,13 +10,16 @@ const {
   sendJson,
   sendEmpty,
   readJson,
+  readForm,
   parseTarget,
   hasControlChars,
 } = require('./util');
 const auth = require('./auth');
 const { validateSubscription } = require('./push');
+const { MAX_SMS_BODY_CHARS } = require('./sms');
 
 const JSON_LIMIT = 64 * 1024;
+const FORM_LIMIT = 64 * 1024; // Twilio webhooks are a few KB at most
 const ATTACHMENT_LIMIT = 10 * 1024 * 1024;
 const ATTACHMENT_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const MAX_BODY_CHARS = 4000;
@@ -62,7 +65,42 @@ function positiveInt(value, name) {
 
 // ---- handler factory --------------------------------------------------------
 
-function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLimiter, trustProxy, log = console }) {
+function validateTitle(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') throw new HttpError(400, 'Title must be a string');
+  const t = value.trim();
+  if (t.length > MAX_TITLE_CHARS) throw new HttpError(400, `Title must be at most ${MAX_TITLE_CHARS} characters`);
+  if (hasControlChars(t)) throw new HttpError(400, 'Title contains invalid characters');
+  return t || null;
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest();
+}
+
+const TWIML_EMPTY = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+function sendTwiml(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/xml; charset=utf-8',
+    'Content-Length': Buffer.byteLength(TWIML_EMPTY),
+    'Cache-Control': 'no-store',
+  });
+  res.end(TWIML_EMPTY);
+}
+
+function createHttpHandler({
+  store,
+  hub,
+  push,
+  sms,
+  signupCode = null,
+  staticHandler,
+  uploadsDir,
+  rateLimiter,
+  trustProxy,
+  log = console,
+}) {
   function clientIp(req) {
     if (trustProxy) {
       const xff = req.headers['x-forwarded-for'];
@@ -118,6 +156,13 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
   async function register(req, res) {
     rateLimit(req);
     const body = await readJson(req, JSON_LIMIT);
+    if (signupCode) {
+      const given = typeof body.signupCode === 'string' ? body.signupCode.trim() : '';
+      // Compare digests so the check takes the same time whatever was typed.
+      if (!crypto.timingSafeEqual(sha256(given), sha256(signupCode))) {
+        throw new HttpError(403, "That signup code isn't right.");
+      }
+    }
     const username = validateUsername(body.username);
     const password = validatePassword(body.password);
     let displayName = username;
@@ -162,7 +207,7 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
 
   async function getMe(req, res) {
     const { user } = authenticate(req);
-    sendJson(res, 200, { user });
+    sendJson(res, 200, { user, sms: sms.infoFor(user) });
   }
 
   async function patchMe(req, res) {
@@ -209,14 +254,7 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     for (const id of others) {
       if (!store.getUser(id)) throw new HttpError(400, 'Unknown user in memberIds');
     }
-    let title = null;
-    if (body.title !== undefined && body.title !== null) {
-      if (typeof body.title !== 'string') throw new HttpError(400, 'Title must be a string');
-      const t = body.title.trim();
-      if (t.length > MAX_TITLE_CHARS) throw new HttpError(400, `Title must be at most ${MAX_TITLE_CHARS} characters`);
-      if (hasControlChars(t)) throw new HttpError(400, 'Title contains invalid characters');
-      title = t || null;
-    }
+    const title = validateTitle(body.title);
     const memberIds = [user.id, ...others];
     const isDm = others.length === 1 && title === null;
     let conv;
@@ -267,6 +305,38 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     }
   }
 
+  async function createSmsConversation(req, res) {
+    const { user } = authenticate(req);
+    const body = await readJson(req, JSON_LIMIT);
+    const from = sms.numberForUser(user);
+    if (!from) throw new HttpError(403, "Your account can't text phone numbers");
+    const phone = sms.normalizePhone(body.phone);
+    if (!phone) throw new HttpError(400, "That doesn't look like a phone number");
+    if (phone === from) throw new HttpError(400, "That's your own TealTalk texting number");
+    const title = validateTitle(body.title);
+    const { row, created } = sms.createConversation(user, phone, title);
+    sendJson(res, created ? 201 : 200, { conversation: store.conversationFor(row, user.id) });
+    if (created) broadcastConversation(row);
+  }
+
+  async function patchConversation(req, res, id) {
+    const { user } = authenticate(req);
+    const conv = memberConversation(id, user.id);
+    const body = await readJson(req, JSON_LIMIT);
+    if (!('title' in body)) throw new HttpError(400, 'title is required');
+    const title = validateTitle(body.title);
+    if (conv.sms_phone) {
+      // Any title, or null to show the phone number.
+    } else if (conv.is_group) {
+      if (!title) throw new HttpError(400, 'Group name must be 1-80 characters');
+    } else {
+      throw new HttpError(400, "1:1 chats can't be renamed");
+    }
+    const updated = store.updateConversationTitle(conv.id, title);
+    sendJson(res, 200, { conversation: store.conversationFor(updated, user.id) });
+    if ((conv.title ?? null) !== title) broadcastConversation(updated);
+  }
+
   async function getConversation(req, res, id) {
     const { user } = authenticate(req);
     const conv = memberConversation(id, user.id);
@@ -313,6 +383,14 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
       attachmentId = att.id;
     }
     if (!text && !attachmentId) throw new HttpError(400, 'Message is empty');
+    if (conv.sms_phone) {
+      if (conv.sms_owner_id !== user.id || !sms.numberForUser(user)) {
+        throw new HttpError(403, "Your account can't text phone numbers");
+      }
+      if (text.length > MAX_SMS_BODY_CHARS) {
+        throw new HttpError(400, `Text messages can be at most ${MAX_SMS_BODY_CHARS} characters`);
+      }
+    }
 
     let message;
     try {
@@ -323,6 +401,7 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
         body: text,
         attachmentId,
         createdAt: Date.now(),
+        smsStatus: conv.sms_phone ? 'queued' : null,
       });
     } catch (err) {
       // Concurrent retry with the same clientId.
@@ -338,6 +417,7 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     const memberIds = store.memberIds(conv.id);
     hub.sendToUsers(memberIds, { type: 'message', message });
     push.notifyMessage(message, conv, user, memberIds);
+    if (conv.sms_phone) sms.send(message, conv, user);
   }
 
   async function markRead(req, res, id) {
@@ -399,6 +479,10 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     const att = ID_RE.test(id) ? store.getAttachment(id) : null;
     if (!att) throw new HttpError(404, 'Attachment not found');
     if (!store.canReadAttachment(att.id, user.id)) throw new HttpError(403, 'You cannot view this attachment');
+    serveAttachment(req, res, att, 'private, max-age=31536000, immutable');
+  }
+
+  function serveAttachment(req, res, att, cacheControl) {
     const file = path.join(uploadsDir, att.id);
     let st;
     try {
@@ -409,7 +493,7 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     const headers = {
       'Content-Type': att.mime,
       'Content-Length': st.size,
-      'Cache-Control': 'private, max-age=31536000, immutable',
+      'Cache-Control': cacheControl,
       'Content-Disposition': 'inline',
       ETag: `"${att.id}"`,
     };
@@ -427,6 +511,41 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     const stream = fs.createReadStream(file);
     stream.on('error', () => res.destroy());
     stream.pipe(res);
+  }
+
+  // ---- SMS (Twilio) -----------------------------------------------------------
+
+  /** Parses a Twilio form post and checks X-Twilio-Signature against PUBLIC_URL + the request path. */
+  async function twilioParams(req) {
+    if (!sms.enabled) throw new HttpError(404, 'Texting is not set up on this server');
+    const signature = req.headers['x-twilio-signature'];
+    if (typeof signature !== 'string' || !signature) throw new HttpError(403, 'Missing Twilio signature');
+    const params = await readForm(req, FORM_LIMIT);
+    if (!sms.verifyWebhook(req.url, params, signature)) throw new HttpError(403, 'Invalid Twilio signature');
+    return params;
+  }
+
+  async function twilioIncoming(req, res) {
+    const params = await twilioParams(req);
+    await sms.handleInbound(params);
+    sendTwiml(res);
+  }
+
+  async function twilioStatus(req, res) {
+    const params = await twilioParams(req);
+    sms.handleStatusCallback(params);
+    sendTwiml(res);
+  }
+
+  /** Lets Twilio fetch the photo of an outgoing text via a short-lived signed link (no login). */
+  async function smsMedia(req, res, id, query) {
+    if (!sms.enabled || !ID_RE.test(id)) throw new HttpError(404, 'Not found');
+    if (!sms.verifyMediaLink(id, query.get('exp'), query.get('sig'))) {
+      throw new HttpError(403, 'This link is invalid or has expired');
+    }
+    const att = store.getAttachment(id);
+    if (!att || !store.isOutgoingSmsAttachment(att.id)) throw new HttpError(404, 'Not found');
+    serveAttachment(req, res, att, 'private, no-store');
   }
 
   async function pushSubscribe(req, res) {
@@ -484,13 +603,19 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
         return pick({ POST: pushSubscribe })(req, res);
       case '/api/push/unsubscribe':
         return pick({ POST: pushUnsubscribe })(req, res);
+      case '/api/sms/conversations':
+        return pick({ POST: createSmsConversation })(req, res);
+      case '/api/sms/twilio':
+        return pick({ POST: twilioIncoming })(req, res);
+      case '/api/sms/twilio/status':
+        return pick({ POST: twilioStatus })(req, res);
       default:
         break;
     }
     let match = /^\/api\/conversations\/([^/]+)(?:\/(messages|read))?$/.exec(pathname);
     if (match) {
       const id = match[1];
-      if (!match[2]) return pick({ GET: getConversation })(req, res, id);
+      if (!match[2]) return pick({ GET: getConversation, PATCH: patchConversation })(req, res, id);
       if (match[2] === 'messages') {
         return pick({ GET: listMessages, POST: postMessage })(req, res, id, query);
       }
@@ -498,6 +623,8 @@ function createHttpHandler({ store, hub, push, staticHandler, uploadsDir, rateLi
     }
     match = /^\/api\/attachments\/([^/]+)$/.exec(pathname);
     if (match) return pick({ GET: getAttachment })(req, res, match[1], query);
+    match = /^\/api\/sms\/media\/([^/]+)$/.exec(pathname);
+    if (match) return pick({ GET: smsMedia })(req, res, match[1], query);
     throw new HttpError(404, 'Not found');
   }
 
