@@ -375,7 +375,9 @@ function deviceFactory({ browser, serverHost, foreignRequests, consoleErrors, ex
     page.on('request', (req) => watch(req.url()));
     page.on('websocket', (ws) => watch(ws.url()));
     page.on('console', (msg) => {
-      if (msg.type() === 'error' && !expectedError(msg.text(), msg)) consoleErrors.push(`${label}: ${msg.text()}`);
+      if (msg.type() !== 'error' || expectedError(msg.text(), msg)) return;
+      const where = (msg.location() && msg.location().url) || '';
+      consoleErrors.push(`${label}: ${msg.text()}${where && !msg.text().includes(where) ? ` (${where})` : ''}`);
     });
     page.on('pageerror', (err) => consoleErrors.push(`${label} pageerror: ${err.message}`));
     return { context, page };
@@ -395,6 +397,38 @@ function messagesWithBody(page, body) {
   return tid(page, 'message').filter({ has: page.getByTestId('message-body').getByText(body, { exact: true }) });
 }
 
+const RECOVERY_KEY_FORMAT = /^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){7}$/;
+
+/**
+ * The recovery-key screen after a new key was made (first setup, a reset or Start fresh):
+ * read the key and confirm it was saved, re-typing its last group when the app asks for
+ * that. Resolves to the key once the screen is gone (to the chat list, or back to Settings
+ * after a reset from there).
+ */
+async function saveRecoveryKey(page) {
+  const screen = tid(page, 'recovery-key-screen');
+  await screen.waitFor();
+  const key = await until('recovery key on screen', async () => {
+    const shown = await text(tid(page, 'recovery-key-display'));
+    return RECOVERY_KEY_FORMAT.test(shown) && shown;
+  });
+  const confirmInput = tid(page, 'recovery-confirm-input');
+  if (!(await confirmInput.isVisible())) await tid(page, 'recovery-saved-button').click();
+  // The confirm step may come with the key or only after "I've saved it".
+  const next = await until('recovery key screen done or confirm step', async () => {
+    if (await confirmInput.isVisible()) return 'confirm';
+    if (await screen.isHidden()) return 'done';
+    return null;
+  });
+  if (next === 'confirm') {
+    await confirmInput.fill(key.split('-').pop());
+    await tid(page, 'recovery-confirm-button').click();
+    await screen.waitFor({ state: 'hidden' });
+  }
+  return key;
+}
+
+/** Create an account; resolves to its recovery key (8 groups of 4). */
 async function register(page, url, username, displayName) {
   await page.goto(url);
   await tid(page, 'auth-screen').waitFor();
@@ -403,15 +437,149 @@ async function register(page, url, username, displayName) {
   await tid(page, 'auth-displayname').fill(displayName);
   await tid(page, 'auth-password').fill(PASSWORD);
   await tid(page, 'auth-submit').click();
+  const key = await saveRecoveryKey(page);
   await tid(page, 'chats-screen').waitFor();
+  return key;
 }
 
-async function login(page, username) {
+/**
+ * Log in. On a device without this account's key the app asks for the recovery key
+ * (`recoveryKey` must then be given); an account that never set up encryption gets a
+ * new key, whose recovery key is saved. Resolves to the screen that came up first:
+ * 'chats', 'recovery' or 'new-key'.
+ */
+async function login(page, username, { recoveryKey = null } = {}) {
   await tid(page, 'auth-screen').waitFor();
   await tid(page, 'auth-username').fill(username);
   await tid(page, 'auth-password').fill(PASSWORD);
   await tid(page, 'auth-submit').click();
-  await tid(page, 'chats-screen').waitFor();
+  const first = await until('chat list or recovery screen', async () => {
+    if (await tid(page, 'chats-screen').isVisible()) return 'chats';
+    if (await tid(page, 'recovery-screen').isVisible()) return 'recovery';
+    if (await tid(page, 'recovery-key-screen').isVisible()) return 'new-key';
+    return null;
+  }, 15000);
+  if (first === 'recovery') {
+    assert(recoveryKey, `${username} needs a recovery key on this device`);
+    await enterRecoveryKey(page, recoveryKey);
+    await tid(page, 'chats-screen').waitFor();
+  } else if (first === 'new-key') {
+    await saveRecoveryKey(page);
+    await tid(page, 'chats-screen').waitFor();
+  }
+  return first;
+}
+
+async function enterRecoveryKey(page, recoveryKey) {
+  await tid(page, 'recovery-input').fill(recoveryKey);
+  await tid(page, 'recovery-submit').click();
+}
+
+/**
+ * Settings -> Log out, accepting the "you'll need your recovery key" warning.
+ * Resolves to the warning's text ('' if none was shown).
+ */
+async function logout(page) {
+  let warning = '';
+  const onDialog = (d) => {
+    warning = d.message();
+    d.accept().catch(() => {});
+  };
+  page.on('dialog', onDialog);
+  try {
+    // From a chat, go back to the list (a back tap may already be on its way).
+    await until('chat list', async () => {
+      if (await tid(page, 'chats-screen').isVisible()) return true;
+      if (await tid(page, 'back-button').isVisible()) await tid(page, 'back-button').click({ timeout: 1000 }).catch(() => {});
+      return false;
+    });
+    await tid(page, 'settings-button').click();
+    await tid(page, 'settings-screen').waitFor();
+    await tid(page, 'logout-button').click();
+    await tid(page, 'auth-screen').waitFor();
+  } finally {
+    page.off('dialog', onDialog);
+  }
+  return warning;
+}
+
+/**
+ * Send text messages as the user logged in on `page` without the composer: sealed by
+ * the app's own encryption code (the same module instance, so the same keys) and
+ * posted straight to the API, like another device of theirs. Resolves to the new ids.
+ */
+function postSealed(page, conversationId, bodies) {
+  return page.evaluate(
+    async ({ conversationId: convId, bodies: texts }) => {
+      const { sendSealed } = await import('/js/e2ee.js');
+      const { Api } = await import('/js/api.js');
+      const { conversation } = await Api.conversation(convId);
+      const recipientIds = conversation.members.map((m) => m.id);
+      const ids = [];
+      for (const body of texts) {
+        const clientId = crypto.randomUUID();
+        const { message } = await sendSealed({
+          conversationId: convId,
+          kind: 'message',
+          payload: { kind: 'message', body, attachments: [], replyTo: null },
+          clientId,
+          recipientIds,
+          post: (e2ee) => Api.sendMessage(convId, { clientId, e2ee }),
+        });
+        ids.push(message.id);
+      }
+      return ids;
+    },
+    { conversationId, bodies },
+  );
+}
+
+/**
+ * Init script (context.addInitScript): remembers every object URL the page makes, so a
+ * test can read decrypted media (the CSP rightly forbids fetch() of blob: URLs) and count
+ * the ones still alive. Decrypted media of the open chat legitimately stays alive, so leak
+ * checks count only the URLs made after a mark: __liveObjectUrls(__objectUrlMark()).
+ */
+function trackObjectUrls() {
+  const live = new Map(); // url -> creation sequence number
+  const objects = new Map(); // url -> Blob, kept for reading even after revoke
+  let seq = 0;
+  const create = URL.createObjectURL.bind(URL);
+  const revoke = URL.revokeObjectURL.bind(URL);
+  URL.createObjectURL = (obj) => {
+    const url = create(obj);
+    live.set(url, ++seq);
+    objects.set(url, obj);
+    return url;
+  };
+  URL.revokeObjectURL = (url) => {
+    live.delete(url);
+    return revoke(url);
+  };
+  window.__objectUrlMark = () => seq;
+  window.__liveObjectUrls = (since = 0) => [...live.values()].filter((n) => n > since).length;
+  window.__blobFor = (url) => objects.get(url) || null;
+}
+
+/** Bytes behind a blob: URL in the page (decrypted media), as a Buffer. Needs trackObjectUrls. */
+async function blobBytes(page, url) {
+  const bytes = await page.evaluate(async (u) => {
+    const blob = window.__blobFor(u);
+    if (!blob) throw new Error(`no Blob known for ${u}`);
+    return Array.from(new Uint8Array(await blob.arrayBuffer()));
+  }, url);
+  return Buffer.from(bytes);
+}
+
+/** { type, size, sha256 } of the Blob behind a blob: URL, hashed in the page (for big files). */
+function blobInfo(page, url) {
+  return page.evaluate(async (u) => {
+    const blob = window.__blobFor(u);
+    if (!blob) throw new Error(`no Blob known for ${u}`);
+    const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+    const sha256 = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+    return { type: blob.type, size: blob.size, sha256 };
+  }, url);
 }
 
 function conversationItem(page, convId) {
@@ -524,8 +692,16 @@ module.exports = {
   tid,
   text,
   messagesWithBody,
+  RECOVERY_KEY_FORMAT,
+  saveRecoveryKey,
   register,
   login,
+  enterRecoveryKey,
+  logout,
+  postSealed,
+  trackObjectUrls,
+  blobBytes,
+  blobInfo,
   conversationItem,
   openConversation,
   sendText,

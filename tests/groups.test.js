@@ -5,7 +5,7 @@
 const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { startApp, request, register, send, WsClient, MEDIA_HEADS, mediaFile, uploadOk } = require('./helpers');
+const { startApp, request, register, send, postEncrypted, makeEnvelope, react, edit, textOf, uploadEncrypted, WsClient } = require('./helpers');
 
 describe('groups: rename, add, leave, system messages', () => {
   let app;
@@ -24,8 +24,7 @@ describe('groups: rename, add, leave, system messages', () => {
   const leave = (who, id) => request(app, 'DELETE', `/api/conversations/${id}/members/me`, { token: who.token });
   const list = async (who, id, qs = '') => request(app, 'GET', `/api/conversations/${id}/messages${qs}`, { token: who.token });
   const convFor = async (who, id) => (await request(app, 'GET', `/api/conversations/${id}`, { token: who.token })).body.conversation;
-  const post = (who, id, body) =>
-    request(app, 'POST', `/api/conversations/${id}/messages`, { token: who.token, body: { clientId: crypto.randomUUID(), ...body } });
+  const post = (who, id, { body = '', ...extra } = {}) => postEncrypted(app, who, id, body, extra);
 
   before(async () => {
     app = await startApp({
@@ -89,9 +88,9 @@ describe('groups: rename, add, leave, system messages', () => {
 
       // System messages can't be reacted to, replied to, edited or unsent.
       const base = `/api/conversations/${g.id}/messages/${sys.id}`;
-      assert.equal((await request(app, 'PUT', `${base}/reaction`, { token: bob.token, body: { emoji: '👍' } })).status, 400);
+      assert.equal((await react(app, bob, g.id, sys.id, '👍')).status, 400);
       assert.equal((await post(bob, g.id, { body: 'hi', replyToId: sys.id })).status, 400);
-      assert.equal((await request(app, 'PATCH', base, { token: alice.token, body: { body: 'x' } })).status, 400);
+      assert.equal((await edit(app, alice, g.id, sys.id, 'x')).status, 400);
       assert.equal((await request(app, 'DELETE', base, { token: alice.token })).status, 400);
     } finally {
       await ws.close();
@@ -100,10 +99,10 @@ describe('groups: rename, add, leave, system messages', () => {
 
   test('added members see history only from when they joined', async () => {
     const g = await group(alice, [bob], 'Book club');
-    const photo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
-    const video = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${photo.id}`);
+    const photo = await uploadEncrypted(app, alice);
+    const video = await uploadEncrypted(app, alice);
     const before1 = await send(app, alice, g.id, 'before carol joined');
-    const before2 = await send(app, alice, g.id, '', { attachmentId: video.id });
+    const before2 = await send(app, alice, g.id, '', { attachmentIds: [video.id, photo.id] });
     const aliceWs = await WsClient.connect(app, alice.token);
     const carolWs = await WsClient.connect(app, carol.token);
     try {
@@ -145,12 +144,21 @@ describe('groups: rename, add, leave, system messages', () => {
         assert.equal((await request(app, 'GET', `/api/attachments/${id}`, { token: alice.token })).status, 200, id);
       }
       const base = `/api/conversations/${g.id}/messages/${before1.id}`;
-      assert.equal((await request(app, 'PUT', `${base}/reaction`, { token: carol.token, body: { emoji: '👍' } })).status, 404);
+      assert.equal((await react(app, carol, g.id, before1.id, '👍')).status, 404);
       assert.equal((await post(carol, g.id, { body: 'quote', replyToId: before1.id })).status, 400);
       assert.equal((await request(app, 'POST', `/api/conversations/${g.id}/read`, { token: carol.token, body: { messageId: before1.id } })).status, 400);
       // Changes to old messages are not sent to her either.
-      await request(app, 'PUT', `${base}/reaction`, { token: bob.token, body: { emoji: '❤️' } });
-      await aliceWs.next('message', (f) => f.message.id === before1.id);
+      // Reactions to it are addressed to the members who can see it: not Carol.
+      const everyone = await request(app, 'PUT', `${base}/reaction`, {
+        token: bob.token,
+        body: { clientId: crypto.randomUUID(), e2ee: await makeEnvelope(app, bob, g.id, { kind: `reaction:${before1.id}` }) },
+      });
+      assert.equal(everyone.status, 409);
+      assert.deepEqual(everyone.body, { error: 'members_changed', members: [alice.user.id, bob.user.id] });
+      assert.equal((await react(app, bob, g.id, before1.id, '❤️')).status, 200);
+      const reacted = await aliceWs.next('message', (f) => f.message.id === before1.id);
+      assert.deepEqual(Object.keys(reacted.message.reactions), [bob.user.id]);
+      assert.deepEqual(Object.keys(reacted.message.reactions[bob.user.id].keys).sort(), [alice.user.id, bob.user.id].sort());
       assert.ok(await carolWs.none('message', (f) => f.message.id === before1.id));
 
       // New messages reach her normally and count as unread.
@@ -160,11 +168,13 @@ describe('groups: rename, add, leave, system messages', () => {
       assert.equal(carolConv.unreadCount, 1);
       assert.equal(carolConv.lastMessage.id, after1.id);
       assert.equal((await post(carol, g.id, { body: 'thanks', replyToId: after1.id })).status, 201);
-      assert.equal((await request(app, 'PUT', `/api/conversations/${g.id}/messages/${sys.id}/reaction`, { token: carol.token, body: { emoji: '👍' } })).status, 400);
+      assert.equal((await react(app, carol, g.id, sys.id, '👍')).status, 400);
+      // The newcomer's own messages and reactions to new messages include everyone.
+      assert.equal((await react(app, carol, g.id, after1.id, '🙏')).status, 200);
       // No push for the system line; alice and bob got pushes only if offline (bob is offline).
       await app.push.idle();
       assert.deepEqual(
-        pushes.map((p) => p.body),
+        pushes.map((p) => textOf(p.e2ee)),
         ['welcome carol', 'thanks']
       );
     } finally {

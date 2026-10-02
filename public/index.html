@@ -65,6 +65,66 @@
       </div>
     </section>
 
+    <!-- Encryption: setting up -->
+    <section class="screen auth-screen keys-screen" data-testid="key-setup-screen" id="key-setup-screen" hidden aria-labelledby="key-setup-heading">
+      <div class="auth-card">
+        <img class="auth-logo" src="/icons/icon.svg" alt="" width="72" height="72">
+        <h1 id="key-setup-heading" class="auth-title">Encryption</h1>
+        <p class="auth-tagline" id="key-setup-text" role="status" aria-live="polite">Setting up encryption…</p>
+        <p class="form-error" id="key-setup-error" role="alert" hidden></p>
+        <button class="btn primary block" id="key-setup-retry" type="button" hidden>Try again</button>
+        <p class="auth-switch"><button class="btn link" id="key-setup-logout" type="button">Log out</button></p>
+      </div>
+    </section>
+
+    <!-- Encryption: your recovery key -->
+    <section class="screen auth-screen keys-screen" data-testid="recovery-key-screen" id="recovery-key-screen" hidden aria-labelledby="recovery-key-heading">
+      <div class="auth-card">
+        <img class="auth-logo" src="/icons/icon.svg" alt="" width="72" height="72">
+        <h1 id="recovery-key-heading" class="auth-title">Your recovery key</h1>
+        <p class="keys-text" id="recovery-key-intro"></p>
+        <p class="recovery-key" data-testid="recovery-key-display" id="recovery-key-display" aria-label="Recovery key"></p>
+        <button class="btn secondary block" data-testid="recovery-copy-button" id="recovery-copy-button" type="button">Copy</button>
+        <form id="recovery-confirm-form" class="auth-form" novalidate>
+          <label class="field">
+            <span class="field-label">To check you saved it, type the last group of 4</span>
+            <input data-testid="recovery-confirm-input" id="recovery-confirm-input" type="text" class="recovery-input"
+                   autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false"
+                   placeholder="XXXX" maxlength="9" enterkeyhint="done">
+          </label>
+          <p class="form-error" id="recovery-confirm-error" role="alert" hidden></p>
+          <button class="btn primary block" data-testid="recovery-confirm-button" id="recovery-confirm-button" type="submit">I’ve saved it</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- Encryption: enter the recovery key on a new device -->
+    <section class="screen auth-screen keys-screen" data-testid="recovery-screen" id="recovery-screen" hidden aria-labelledby="recovery-heading">
+      <div class="auth-card">
+        <img class="auth-logo" src="/icons/icon.svg" alt="" width="72" height="72">
+        <h1 id="recovery-heading" class="auth-title">Enter your recovery key</h1>
+        <div class="key-conflict" data-testid="key-conflict-screen" id="key-conflict-screen" role="alert" hidden>
+          <p class="keys-text" id="key-conflict-text"></p>
+        </div>
+        <p class="keys-text" id="recovery-text"></p>
+        <form id="recovery-form" class="auth-form" novalidate>
+          <label class="field">
+            <span class="field-label">Recovery key</span>
+            <input data-testid="recovery-input" id="recovery-input" type="text" class="recovery-input"
+                   autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false"
+                   placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" maxlength="80" enterkeyhint="go">
+          </label>
+          <p class="form-error" data-testid="recovery-error" id="recovery-error" role="alert" hidden></p>
+          <button class="btn primary block" data-testid="recovery-submit" id="recovery-submit" type="submit">Unlock my messages</button>
+        </form>
+        <div class="keys-alt">
+          <p class="keys-text"><strong>Lost your recovery key?</strong> Start fresh with a new key. Messages sent before now stay locked, and your contacts will see that your safety number changed.</p>
+          <button class="btn secondary block" data-testid="recovery-reset-button" id="recovery-reset-button" type="button">Start fresh</button>
+          <p class="auth-switch"><button class="btn link" data-testid="recovery-logout-button" id="recovery-logout-button" type="button">Log out</button></p>
+        </div>
+      </div>
+    </section>
+
     <!-- Chat list -->
     <section class="screen chats-screen" data-testid="chats-screen" id="chats-screen" hidden aria-labelledby="chats-heading">
       <header class="bar">
@@ -126,9 +186,12 @@
         </button>
         <span class="chat-avatar" id="chat-avatar"></span>
         <div class="chat-head">
-          <h1 class="bar-title chat-title" data-testid="chat-title" id="chat-title"></h1>
+          <h1 class="bar-title chat-title"><span data-testid="chat-title" id="chat-title"></span><span class="verified-badge" id="chat-verified-badge" title="Verified" hidden><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5zm-1.4 14.6L7 13l1.4-1.4 2.2 2.2 5-5L17 10.2z"/></svg><span class="sr-only">Verified</span></span></h1>
           <p class="chat-subtitle" id="chat-subtitle"></p>
         </div>
+        <button class="icon-btn" id="verify-safety-button" type="button" aria-label="Safety number" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3Zm0 2.2 6 2.2V11c0 4-2.6 7.8-6 8.9-3.4-1.1-6-4.9-6-8.9V6.4l6-2.2Z"/></svg>
+        </button>
         <button class="icon-btn" data-testid="group-info-button" id="group-info-button" type="button" aria-label="Group info" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z"/></svg>
         </button>
@@ -240,9 +303,22 @@
           </ol>
         </section>
 
+        <section class="card" aria-labelledby="encryption-heading">
+          <h2 id="encryption-heading">Encryption</h2>
+          <p>Messages, photos, videos, voice messages, reactions and edits are end-to-end encrypted: only the people in a chat can read them, not the TealTalk server.</p>
+          <p>Your recovery key gets your messages back on a new phone or after logging out. TealTalk showed it once when you set up and doesn’t keep a copy.</p>
+          <p class="form-status error" data-testid="recovery-unconfirmed-note" id="recovery-unconfirmed-note" hidden>You didn’t confirm saving the recovery key for this key. Reset your key to get a new one.</p>
+          <p><strong>Lost your recovery key?</strong> Reset your key (old messages stay readable only on devices that have them).</p>
+          <button class="btn secondary block danger-text" data-testid="reset-keys-button" id="reset-keys-button" type="button">Reset key</button>
+          <p class="form-status" id="keys-status" role="status" aria-live="polite"></p>
+        </section>
+
         <section class="card" aria-labelledby="about-heading">
           <h2 id="about-heading">About</h2>
           <p>TealTalk has no ads, no trackers and no analytics. It loads nothing from anyone else's servers. Your bubbles are teal and everyone else's are grey, on every phone.</p>
+          <p class="fingerprint-label">App fingerprint</p>
+          <p class="fingerprint"><code data-testid="app-fingerprint" id="app-fingerprint"></code></p>
+          <p class="hint">Compare it with the one published for this release on GitHub. If they differ, this server is sending a modified app.</p>
         </section>
 
         <button class="btn danger block" data-testid="logout-button" id="logout-button" type="button">Log out</button>
@@ -278,6 +354,42 @@
         <button class="btn danger block" data-testid="leave-group-button" id="leave-group-button" type="button">Leave group</button>
       </div>
     </section>
+
+    <!-- Safety number -->
+    <section class="screen safety-screen" data-testid="safety-screen" id="safety-screen" hidden aria-labelledby="safety-heading">
+      <header class="bar">
+        <button class="icon-btn" data-testid="safety-back" id="safety-back" type="button" aria-label="Back">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg>
+        </button>
+        <h1 class="bar-title" id="safety-heading">Safety number</h1>
+      </header>
+      <div class="scroll settings-body">
+        <section class="card group-card" aria-labelledby="safety-name">
+          <span id="safety-avatar"></span>
+          <h2 class="group-name" id="safety-name"></h2>
+          <p class="safety-verified" id="safety-verified-badge" hidden>Verified</p>
+          <p class="safety-number" data-testid="safety-number" id="safety-number" aria-live="polite"></p>
+          <p class="form-error" id="safety-error" role="alert" hidden></p>
+          <p class="hint" id="safety-explain"></p>
+          <p class="form-status" id="safety-status" role="status" aria-live="polite"></p>
+          <button class="btn primary" data-testid="mark-verified-button" id="mark-verified-button" type="button" hidden>Mark as verified</button>
+          <button class="btn secondary" data-testid="unmark-verified-button" id="unmark-verified-button" type="button" hidden>Clear verification</button>
+        </section>
+      </div>
+    </section>
+
+    <!-- A verified contact's safety number changed -->
+    <dialog class="sheet" data-testid="safety-interstitial" id="safety-dialog" aria-labelledby="safety-dialog-title">
+      <div class="sheet-form">
+        <h2 class="sheet-title" id="safety-dialog-title">Safety number changed</h2>
+        <p class="sheet-text" id="safety-dialog-text"></p>
+        <div class="sheet-actions">
+          <button class="btn secondary" id="safety-dialog-cancel" type="button">Not now</button>
+          <button class="btn secondary" data-testid="safety-send-anyway" id="safety-send-anyway" type="button">Send anyway</button>
+          <button class="btn primary" data-testid="safety-verify-again" id="safety-verify-again" type="button">Verify again</button>
+        </div>
+      </div>
+    </dialog>
 
     <!-- Rename a group -->
     <dialog class="sheet" id="rename-dialog" aria-labelledby="rename-heading">

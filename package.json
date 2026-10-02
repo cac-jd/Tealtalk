@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node --no-warnings=ExperimentalWarning server/index.js",
-    "test": "node --no-warnings=ExperimentalWarning --test tests/*.test.js",
-    "test:e2e": "node tests/e2e/cross-platform.e2e.js && node tests/e2e/media-and-reactions.e2e.js"
+    "test": "node --no-warnings=ExperimentalWarning --test --test-force-exit tests/*.test.js",
+    "test:e2e": "node tests/e2e/cross-platform.e2e.js && node tests/e2e/media-and-reactions.e2e.js && node tests/e2e/encryption.e2e.js",
+    "fingerprint": "node scripts/fingerprint.js"
   },
   "license": "MIT",
   "dependencies": {

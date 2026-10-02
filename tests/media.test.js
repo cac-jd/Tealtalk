@@ -20,6 +20,10 @@ const {
   uploadSmall,
   uploadOk,
   fakeClock,
+  postEncrypted,
+  uploadEncrypted,
+  insertLegacyMessage,
+  E2EE_MIME,
 } = require('./helpers');
 const { sniff, matchesKind, parseRange, kindOf } = require('../server/media');
 
@@ -78,6 +82,7 @@ describe('media: magic numbers and ranges (pure)', () => {
     assert.equal(kindOf('video/quicktime'), 'video');
     assert.equal(kindOf('audio/webm;codecs=opus'), 'audio');
     assert.equal(kindOf('audio/mp4'), 'audio');
+    assert.equal(kindOf('application/vnd.tealtalk.e2ee'), 'e2ee');
     for (const bad of ['image/svg+xml', 'text/html', 'video/x-msvideo', 'audio/wav', 'image/heic', '', undefined]) {
       assert.equal(kindOf(bad), null, String(bad));
     }
@@ -218,7 +223,7 @@ describe('media: single-request uploads', () => {
     }
   });
 
-  test('a thumbnail follows the permissions of the attachment that uses it', async () => {
+  test('legacy messages: a thumbnail follows the permissions of the attachment that uses it', async () => {
     const c = await dm(app, alice, bob);
     const thumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
     const video = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${thumb.id}`);
@@ -227,37 +232,33 @@ describe('media: single-request uploads', () => {
     assert.equal((await get(bob, thumb.id)).status, 403);
     assert.equal((await get(bob, video.id)).status, 403);
 
-    const msg = await send(app, alice, c.id, '', { attachmentId: video.id });
+    // A plaintext file can't go into a new (encrypted) message.
+    const plain = await postEncrypted(app, alice, c.id, '', { attachmentIds: [video.id] });
+    assert.equal(plain.status, 400);
+    assert.match(plain.body.error, /encrypted/);
+
+    // Messages from before v3 keep working.
+    const msg = insertLegacyMessage(app, { conversationId: c.id, senderId: alice.user.id, attachmentId: video.id });
     assert.equal(msg.attachment.thumbnailId, thumb.id);
     assert.equal(msg.attachment.kind, 'video');
+    assert.equal(msg.e2ee, null);
+    assert.deepEqual(msg.attachments, []);
     const bobThumb = await get(bob, thumb.id);
     assert.equal(bobThumb.status, 200);
     assert.equal(bobThumb.headers.get('content-type'), 'image/jpeg');
     assert.equal((await get(bob, video.id)).status, 200);
     assert.equal((await get(carol, thumb.id)).status, 403);
     assert.equal((await get(carol, video.id)).status, 403);
-
-    // A file can only be sent once.
-    const again = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: alice.token,
-      body: { clientId: 'reuse-1', attachmentId: video.id },
-    });
-    assert.equal(again.status, 400);
   });
 
-  test('media is served with its stored type and nosniff; push preview names the kind', async () => {
+  test('media is served with its stored type and nosniff', async () => {
     const c = await dm(app, alice, carol);
     const voice = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.webm), 'audio/webm');
-    await send(app, alice, c.id, '', { attachmentId: voice.id });
+    insertLegacyMessage(app, { conversationId: c.id, senderId: alice.user.id, attachmentId: voice.id });
     const res = await request(app, 'GET', `/api/attachments/${voice.id}?token=${carol.token}`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('content-type'), 'audio/webm');
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
-    const { preview } = require('../server/push');
-    assert.equal(preview('', { kind: 'video' }), 'Video');
-    assert.equal(preview('', { kind: 'audio' }), 'Voice message');
-    assert.equal(preview('', { kind: 'image' }), 'Photo');
-    assert.equal(preview('caption', { kind: 'video' }), 'caption');
   });
 });
 
@@ -276,11 +277,12 @@ describe('media: HTTP Range requests', () => {
     alice = await register(app);
     bob = await register(app);
     carol = await register(app);
-    bytes = mediaFile(MEDIA_HEADS.mp4, 1000);
-    for (let i = 16; i < bytes.length; i++) bytes[i] = i % 251;
-    att = await uploadOk(app, alice, bytes, 'video/mp4');
+    // An encrypted video: opaque bytes, but ranges work on them all the same.
+    bytes = Buffer.alloc(1000);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251;
+    att = await uploadEncrypted(app, alice, bytes);
     const c = await dm(app, alice, bob);
-    await send(app, alice, c.id, '', { attachmentId: att.id });
+    await send(app, alice, c.id, '', { attachmentIds: [att.id] });
   });
   after(() => app.close());
 
@@ -309,7 +311,7 @@ describe('media: HTTP Range requests', () => {
       assert.equal(res.status, 206, range);
       assert.equal(res.headers.get('content-range'), `bytes ${start}-${end}/1000`, range);
       assert.equal(res.headers.get('content-length'), String(end - start + 1), range);
-      assert.equal(res.headers.get('content-type'), 'video/mp4');
+      assert.equal(res.headers.get('content-type'), E2EE_MIME);
       assert.deepEqual(Buffer.from(await res.arrayBuffer()), bytes.subarray(start, end + 1), range);
     }
   });
@@ -365,46 +367,97 @@ describe('media: MEDIA_RETENTION_DAYS sweep', () => {
       const alice = await register(app);
       const bob = await register(app);
       const c = await dm(app, alice, bob);
-      const thumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
-      const oldVideo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${thumb.id}`);
-      const unsent = await uploadOk(app, alice); // uploaded but never posted
-      const oldMsg = await send(app, alice, c.id, 'old', { attachmentId: oldVideo.id });
+      // An encrypted message with two files, and a legacy (pre-v3) video with its thumbnail.
+      const file = await uploadEncrypted(app, alice);
+      const thumb = await uploadEncrypted(app, alice);
+      const legacyThumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
+      const legacyVideo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${legacyThumb.id}`);
+      const oldMsg = await send(app, alice, c.id, 'old', { attachmentIds: [file.id, thumb.id] });
+      const legacyMsg = insertLegacyMessage(app, { conversationId: c.id, senderId: alice.user.id, body: 'old', attachmentId: legacyVideo.id, createdAt: clock() });
+      const late = await uploadEncrypted(app, alice); // uploaded but never sent
 
       clock.advance(29 * DAY);
-      const fresh = await uploadOk(app, alice);
-      const freshMsg = await send(app, alice, c.id, '', { attachmentId: fresh.id });
-      assert.deepEqual(app.sweeper.sweep().expired, []);
+      const fresh = await uploadEncrypted(app, alice);
+      const freshMsg = await send(app, alice, c.id, '', { attachmentIds: [fresh.id] });
+      // `late` was never attached for 29 days, so it is already gone (see the next test).
+      assert.deepEqual(app.sweeper.sweep(), { expired: [], unattached: [late.id], abandoned: [] });
 
       clock.advance(2 * DAY); // the first uploads are now 31 days old, `fresh` 2 days
       const { expired } = app.sweeper.sweep();
-      assert.deepEqual(expired.sort(), [thumb.id, oldVideo.id, unsent.id].sort());
+      assert.deepEqual(expired.sort(), [file.id, thumb.id, legacyThumb.id, legacyVideo.id].sort());
       const uploads = path.join(app.dataDir, 'uploads');
       for (const id of expired) assert.ok(!fs.existsSync(path.join(uploads, id)), id);
       assert.ok(fs.existsSync(path.join(uploads, fresh.id)));
 
       const list = (await request(app, 'GET', `/api/conversations/${c.id}/messages`, { token: bob.token })).body.messages;
       const old = list.find((m) => m.id === oldMsg.id);
-      assert.equal(old.body, 'old');
-      assert.equal(old.attachment.id, oldVideo.id);
-      assert.equal(old.attachment.expired, true);
-      assert.equal(old.attachment.kind, 'video');
-      assert.equal(list.find((m) => m.id === freshMsg.id).attachment.expired, false);
+      assert.deepEqual(old.e2ee, oldMsg.e2ee);
+      assert.deepEqual(old.attachments, [
+        { id: file.id, size: file.size, expired: true },
+        { id: thumb.id, size: thumb.size, expired: true },
+      ]);
+      assert.deepEqual(list.find((m) => m.id === freshMsg.id).attachments, [{ id: fresh.id, size: fresh.size, expired: false }]);
+      const legacy = list.find((m) => m.id === legacyMsg.id);
+      assert.equal(legacy.body, 'old');
+      assert.equal(legacy.attachment.id, legacyVideo.id);
+      assert.equal(legacy.attachment.expired, true);
+      assert.equal(legacy.attachment.kind, 'video');
 
-      const gone = await request(app, 'GET', `/api/attachments/${oldVideo.id}`, { token: bob.token });
-      assert.equal(gone.status, 410);
-      assert.equal((await request(app, 'GET', `/api/attachments/${thumb.id}`, { token: bob.token })).status, 410);
+      for (const id of [file.id, thumb.id, legacyVideo.id, legacyThumb.id]) {
+        assert.equal((await request(app, 'GET', `/api/attachments/${id}`, { token: bob.token })).status, 410, id);
+      }
       assert.equal((await request(app, 'GET', `/api/attachments/${fresh.id}`, { token: bob.token })).status, 200);
       // Strangers still get 403, not a hint that it expired.
       const carol = await register(app);
-      assert.equal((await request(app, 'GET', `/api/attachments/${oldVideo.id}`, { token: carol.token })).status, 403);
+      assert.equal((await request(app, 'GET', `/api/attachments/${file.id}`, { token: carol.token })).status, 403);
       // An expired upload can't be sent.
-      const post = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-        token: alice.token,
-        body: { clientId: 'late', attachmentId: unsent.id },
-      });
+      const expiredUpload = await uploadEncrypted(app, alice);
+      app.store.db.prepare('UPDATE attachments SET expired = 1 WHERE id = ?').run(expiredUpload.id);
+      const post = await postEncrypted(app, alice, c.id, '', { attachmentIds: [expiredUpload.id] });
       assert.equal(post.status, 400);
+      assert.match(post.body.error, /expired/);
       // Sweeping again finds nothing new.
       assert.deepEqual(app.sweeper.sweep().expired, []);
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('files never attached to a message are deleted after 7 days', async () => {
+    const clock = fakeClock(Date.UTC(2026, 0, 1));
+    const app = await startApp({ now: clock }); // even with MEDIA_RETENTION_DAYS = 0
+    try {
+      const alice = await register(app);
+      const bob = await register(app);
+      const c = await dm(app, alice, bob);
+      const sent = await uploadEncrypted(app, alice);
+      const abandoned = await uploadEncrypted(app, alice); // e.g. the thumbnail of a cancelled send
+      const legacyThumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
+      const legacyVideo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${legacyThumb.id}`);
+      const orphanThumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
+      const orphanVideo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${orphanThumb.id}`);
+      await send(app, alice, c.id, '', { attachmentIds: [sent.id] });
+      insertLegacyMessage(app, { conversationId: c.id, senderId: alice.user.id, attachmentId: legacyVideo.id });
+
+      clock.advance(7 * DAY);
+      assert.deepEqual(app.sweeper.sweep().unattached, []); // exactly 7 days: still kept
+      const newer = await uploadEncrypted(app, alice);
+      clock.advance(1);
+      const { unattached } = app.sweeper.sweep();
+      assert.deepEqual(unattached.sort(), [abandoned.id, orphanThumb.id, orphanVideo.id].sort());
+      const uploads = path.join(app.dataDir, 'uploads');
+      for (const id of unattached) {
+        assert.ok(!fs.existsSync(path.join(uploads, id)), id);
+        assert.equal(app.store.getAttachment(id), null, id);
+        assert.equal((await request(app, 'GET', `/api/attachments/${id}`, { token: alice.token })).status, 404, id);
+      }
+      for (const id of [sent.id, legacyThumb.id, legacyVideo.id, newer.id]) {
+        assert.ok(fs.existsSync(path.join(uploads, id)), id);
+        assert.equal((await request(app, 'GET', `/api/attachments/${id}`, { token: alice.token })).status, 200, id);
+      }
+      // A deleted upload can't be sent any more.
+      assert.equal((await postEncrypted(app, alice, c.id, '', { attachmentIds: [abandoned.id] })).status, 400);
+      assert.deepEqual(app.sweeper.sweep().unattached, []);
     } finally {
       await app.close();
     }
@@ -415,10 +468,12 @@ describe('media: MEDIA_RETENTION_DAYS sweep', () => {
     const app = await startApp({ now: clock, mediaRetentionDays: 0 });
     try {
       const alice = await register(app);
-      const att = await uploadOk(app, alice);
+      const bob = await register(app);
+      const att = await uploadEncrypted(app, alice);
+      await send(app, alice, (await dm(app, alice, bob)).id, '', { attachmentIds: [att.id] });
       clock.advance(3650 * DAY);
-      assert.deepEqual(app.sweeper.sweep().expired, []);
-      assert.equal((await request(app, 'GET', `/api/attachments/${att.id}`, { token: alice.token })).status, 200);
+      assert.deepEqual(app.sweeper.sweep(), { expired: [], unattached: [], abandoned: [] });
+      assert.equal((await request(app, 'GET', `/api/attachments/${att.id}`, { token: bob.token })).status, 200);
     } finally {
       await app.close();
     }

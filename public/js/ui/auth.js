@@ -60,6 +60,7 @@ export function initAuth({ onAuthed }) {
       $('auth-password').value = '';
       $('auth-displayname').value = '';
       $('auth-signupcode').value = '';
+      setMode('login'); // after logging out, the screen offers "Log in" again, not "Create account"
       onAuthed();
     } catch (err) {
       showError(

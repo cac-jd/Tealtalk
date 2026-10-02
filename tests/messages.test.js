@@ -1,13 +1,30 @@
 'use strict';
 
-// Reactions, replies, edit and unsend (docs/PROTOCOL.md, "Reactions, replies, edit, unsend").
+// Reactions, replies, edit and unsend with encrypted envelopes (docs/PROTOCOL.md, "Reactions,
+// replies, edit, unsend", and docs/E2EE.md, "Server API changes").
 
 const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { startApp, request, register, dm, send, WsClient, MEDIA_HEADS, mediaFile, uploadOk, fakeClock } = require('./helpers');
+const {
+  startApp,
+  request,
+  register,
+  dm,
+  send,
+  postEncrypted,
+  makeEnvelope,
+  react,
+  edit,
+  textOf,
+  uploadEncrypted,
+  insertLegacyMessage,
+  WsClient,
+  fakeClock,
+  RELOAD,
+} = require('./helpers');
 
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -29,10 +46,13 @@ describe('reactions, replies, edit, unsend', () => {
   let conv;
 
   const url = (c, m, suffix = '') => `/api/conversations/${c}/messages/${m}${suffix}`;
-  const react = (who, m, emoji, c = conv.id) => request(app, 'PUT', url(c, m, '/reaction'), { token: who.token, body: { emoji } });
   const unreact = (who, m, c = conv.id) => request(app, 'DELETE', url(c, m, '/reaction'), { token: who.token });
-  const edit = (who, m, body, c = conv.id) => request(app, 'PATCH', url(c, m), { token: who.token, body: { body } });
   const unsend = (who, m, c = conv.id) => request(app, 'DELETE', url(c, m), { token: who.token });
+  /** A reaction/edit request body for `kind`, addressed to every member of conv. */
+  const actBody = async (who, kind, payload = {}, c = conv.id) => ({
+    clientId: crypto.randomUUID(),
+    e2ee: await makeEnvelope(app, who, c, { kind, payload }),
+  });
   const listFor = async (who, c = conv.id) =>
     (await request(app, 'GET', `/api/conversations/${c}/messages?limit=100`, { token: who.token })).body.messages;
   const convFor = async (who, c = conv.id) => (await request(app, 'GET', `/api/conversations/${c}`, { token: who.token })).body.conversation;
@@ -56,56 +76,71 @@ describe('reactions, replies, edit, unsend', () => {
     pushes = [];
   });
 
-  test('a new message has the v2 fields', async () => {
+  test('a new message has the v3 fields', async () => {
     const m = await send(app, alice, conv.id, 'hello');
+    assert.equal(m.body, '');
+    assert.equal(m.attachment, null);
+    assert.deepEqual(m.attachments, []);
+    assert.equal(m.e2ee.kind, 'message');
+    assert.equal(m.e2eeClientId, m.clientId);
+    assert.equal(textOf(m), 'hello');
     assert.equal(m.replyTo, null);
     assert.deepEqual(m.reactions, {});
+    assert.deepEqual(m.reactionClientIds, {});
+    assert.deepEqual(m.legacyReactions, {});
     assert.equal(m.editedAt, null);
     assert.equal(m.deletedAt, null);
     assert.equal(m.system, null);
     assert.equal(m.createdAt, clock());
   });
 
-  test('reactions: one per person, replace, remove, fan out as the same message', async () => {
+  test('reactions: encrypted, one per person, replace, remove, fan out as the same message', async () => {
     const m = await send(app, alice, conv.id, 'react to me');
+    const kind = `reaction:${m.id}`;
     const ws = await WsClient.connect(app, alice.token);
     try {
-      let res = await react(bob, m.id, '❤️');
-      assert.equal(res.status, 200);
+      const heart = await actBody(bob, kind, { emoji: '❤️' });
+      let res = await request(app, 'PUT', url(conv.id, m.id, '/reaction'), { token: bob.token, body: heart });
+      assert.equal(res.status, 200, res.text);
       assert.equal(res.body.message.id, m.id);
-      assert.deepEqual(res.body.message.reactions, { '❤️': [bob.user.id] });
+      assert.deepEqual(res.body.message.reactions, { [bob.user.id]: heart.e2ee });
+      assert.deepEqual(res.body.message.reactionClientIds, { [bob.user.id]: heart.clientId });
+      assert.deepEqual(res.body.message.legacyReactions, {});
       let ev = await ws.next('message', (f) => f.message.id === m.id);
-      assert.deepEqual(ev.message.reactions, { '❤️': [bob.user.id] });
-      assert.equal(ev.message.body, 'react to me');
+      assert.deepEqual(ev.message.reactions, { [bob.user.id]: heart.e2ee });
+      assert.deepEqual(ev.message.e2ee, m.e2ee);
 
-      res = await react(bob, m.id, '😂');
-      assert.deepEqual(res.body.message.reactions, { '😂': [bob.user.id] });
-      ev = await ws.next('message', (f) => f.message.id === m.id);
-      assert.deepEqual(ev.message.reactions, { '😂': [bob.user.id] });
-
-      res = await react(alice, m.id, '😂');
-      assert.deepEqual(res.body.message.reactions, { '😂': [bob.user.id, alice.user.id] });
-      await ws.next('message', (f) => f.message.id === m.id);
-      res = await react(alice, m.id, '👍');
-      assert.deepEqual(res.body.message.reactions, { '😂': [bob.user.id], '👍': [alice.user.id] });
-      await ws.next('message', (f) => f.message.id === m.id);
-
-      // Same reaction again: no change, no event.
-      res = await react(alice, m.id, '👍');
+      // The same envelope again: no change, no event.
+      res = await request(app, 'PUT', url(conv.id, m.id, '/reaction'), { token: bob.token, body: heart });
       assert.equal(res.status, 200);
       assert.ok(await ws.none('message', (f) => f.message.id === m.id));
 
+      // A new reaction replaces my previous one.
+      res = await react(app, bob, conv.id, m.id, '😂');
+      assert.equal(textOf(res.body.message.reactions[bob.user.id]), '😂');
+      assert.deepEqual(Object.keys(res.body.message.reactions), [bob.user.id]);
+      ev = await ws.next('message', (f) => f.message.id === m.id);
+      assert.equal(textOf(ev.message.reactions[bob.user.id]), '😂');
+
+      res = await react(app, alice, conv.id, m.id, '👍');
+      assert.deepEqual(Object.keys(res.body.message.reactions).sort(), [alice.user.id, bob.user.id].sort());
+      await ws.next('message', (f) => f.message.id === m.id);
+
       res = await unreact(bob, m.id);
       assert.equal(res.status, 200);
-      assert.deepEqual(res.body.message.reactions, { '👍': [alice.user.id] });
+      assert.deepEqual(Object.keys(res.body.message.reactions), [alice.user.id]);
+      assert.deepEqual(Object.keys(res.body.message.reactionClientIds), [alice.user.id]);
       await ws.next('message', (f) => f.message.id === m.id);
       res = await unreact(bob, m.id);
       assert.equal(res.status, 200);
-      assert.deepEqual(res.body.message.reactions, { '👍': [alice.user.id] });
+      assert.ok(await ws.none('message', (f) => f.message.id === m.id));
 
       const listed = (await listFor(bob)).find((x) => x.id === m.id);
-      assert.deepEqual(listed.reactions, { '👍': [alice.user.id] });
+      assert.equal(textOf(listed.reactions[alice.user.id]), '👍');
       assert.equal(app.store.db.prepare('SELECT COUNT(*) AS n FROM reactions WHERE message_id = ?').get(m.id).n, 1);
+      // A reaction is not a new message: no push.
+      await app.push.idle();
+      assert.equal(pushes.length, 0);
     } finally {
       await ws.close();
     }
@@ -113,57 +148,82 @@ describe('reactions, replies, edit, unsend', () => {
 
   test('reaction validation and access', async () => {
     const m = await send(app, bob, conv.id, 'x');
-    for (const emoji of ['👍', '🇺🇸', '1️⃣', '👍🏽', '❤️', '🏳️‍🌈']) {
-      assert.equal((await react(alice, m.id, emoji)).status, 200, emoji);
+    const put = (who, body, c = conv.id, id = m.id) => request(app, 'PUT', url(c, id, '/reaction'), { token: who.token, body });
+    // Plaintext reactions come from an old app.
+    for (const body of [{ emoji: '👍' }, { clientId: 'r', emoji: '👍' }, {}, { clientId: 'r' }]) {
+      const res = await put(alice, body);
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.deepEqual(res.body, { error: RELOAD });
     }
-    const family = '👨‍👩‍👧‍👦'; // one emoji, but 25 bytes
-    for (const emoji of ['', 'a', 'ab', '❤️❤️', '👍 ', ' ', '\u0000', '<script>', family, 42, null, ['👍']]) {
-      assert.equal((await react(alice, m.id, emoji)).status, 400, JSON.stringify(emoji));
+    // The kind must name this message.
+    const other = await send(app, bob, conv.id, 'other');
+    for (const kind of ['message', `edit:${m.id}`, `reaction:${other.id}`, 'reaction:', `reaction:${m.id} `]) {
+      const res = await put(alice, await actBody(alice, kind));
+      assert.equal(res.status, 400, kind);
     }
-    assert.equal((await react(carol, m.id, '👍')).status, 403);
+    const ok = await actBody(alice, `reaction:${m.id}`);
+    for (const clientId of ['', 'x'.repeat(101), 42, null]) {
+      assert.equal((await put(alice, { ...ok, clientId })).status, 400, String(clientId));
+    }
+    assert.equal((await put(alice, ok)).status, 200);
+    assert.equal((await react(app, carol, conv.id, m.id, '👍')).status, 403);
     assert.equal((await unreact(carol, m.id)).status, 403);
-    assert.equal((await react(alice, 999999, '👍')).status, 404);
-    assert.equal((await react(alice, 'abc', '👍')).status, 404);
-    assert.equal((await react(alice, m.id, '👍', 'c_missing')).status, 404);
+    assert.equal((await put(alice, ok, conv.id, 999999)).status, 404);
+    assert.equal((await put(alice, ok, conv.id, 'abc')).status, 404);
+    assert.equal((await put(alice, ok, 'c_missing')).status, 404);
     // A message id from another conversation is not found through this one.
-    const other = await dm(app, alice, carol);
-    const otherMsg = await send(app, carol, other.id, 'elsewhere');
-    assert.equal((await react(alice, otherMsg.id, '👍')).status, 404);
-    assert.equal((await react(bob, otherMsg.id, '👍', other.id)).status, 403);
-    assert.equal((await request(app, 'PUT', url(conv.id, m.id, '/reaction'), { body: { emoji: '👍' } })).status, 401);
-    assert.equal((await request(app, 'POST', url(conv.id, m.id, '/reaction'), { token: alice.token, body: { emoji: '👍' } })).status, 405);
+    const elsewhere = await dm(app, alice, carol);
+    const otherMsg = await send(app, carol, elsewhere.id, 'elsewhere');
+    assert.equal((await put(alice, await actBody(alice, `reaction:${otherMsg.id}`), conv.id, otherMsg.id)).status, 404);
+    assert.equal((await react(app, bob, elsewhere.id, otherMsg.id, '👍')).status, 403);
+    assert.equal((await request(app, 'PUT', url(conv.id, m.id, '/reaction'), { body: ok })).status, 401);
+    assert.equal((await request(app, 'POST', url(conv.id, m.id, '/reaction'), { token: alice.token, body: ok })).status, 405);
   });
 
-  test('replies quote the original (first 200 chars) and must be in the same conversation', async () => {
-    const long = '😀'.repeat(250);
-    const original = await send(app, alice, conv.id, long);
+  test('reactions to legacy messages; legacy plaintext reactions show as legacyReactions', async () => {
+    const legacy = insertLegacyMessage(app, { conversationId: conv.id, senderId: alice.user.id, body: 'from v2', createdAt: clock() });
+    app.store.db.prepare("INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, '😂', ?)").run(legacy.id, bob.user.id, clock());
+    app.store.db.prepare("INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, '😂', ?)").run(legacy.id, alice.user.id, clock());
+    let listed = (await listFor(alice)).find((x) => x.id === legacy.id);
+    assert.equal(listed.e2ee, null);
+    assert.equal(listed.body, 'from v2');
+    assert.deepEqual(listed.reactions, {});
+    assert.deepEqual(listed.legacyReactions, { '😂': [bob.user.id, alice.user.id] });
+    // An encrypted reaction replaces that person's legacy one.
+    const res = await react(app, bob, conv.id, legacy.id, '❤️');
+    assert.equal(res.status, 200);
+    assert.deepEqual(Object.keys(res.body.message.reactions), [bob.user.id]);
+    assert.deepEqual(res.body.message.legacyReactions, { '😂': [alice.user.id] });
+    listed = (await listFor(bob)).find((x) => x.id === legacy.id);
+    assert.equal(textOf(listed.reactions[bob.user.id]), '❤️');
+    assert.deepEqual(listed.legacyReactions, { '😂': [alice.user.id] });
+    // Legacy messages can't be edited with an envelope.
+    const e = await edit(app, alice, conv.id, legacy.id, 'new');
+    assert.equal(e.status, 400);
+  });
+
+  test('replies carry { id, senderId, deleted } and must be in the same conversation', async () => {
+    const original = await send(app, alice, conv.id, 'the original');
     const reply = await send(app, bob, conv.id, 'ha', { replyToId: original.id });
-    assert.deepEqual(reply.replyTo, {
-      id: original.id,
-      senderId: alice.user.id,
-      body: '😀'.repeat(200),
-      attachmentKind: null,
-      deleted: false,
-    });
-    const photo = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
-    const photoMsg = await send(app, alice, conv.id, '', { attachmentId: photo.id });
-    const reply2 = await send(app, bob, conv.id, 'nice', { replyToId: photoMsg.id });
-    assert.deepEqual(reply2.replyTo, { id: photoMsg.id, senderId: alice.user.id, body: '', attachmentKind: 'image', deleted: false });
-    assert.deepEqual((await listFor(alice)).find((x) => x.id === reply2.id).replyTo, reply2.replyTo);
+    assert.deepEqual(reply.replyTo, { id: original.id, senderId: alice.user.id, deleted: false });
+    assert.deepEqual((await listFor(alice)).find((x) => x.id === reply.id).replyTo, reply.replyTo);
+    // Replying to a legacy message works too; a legacy reply keeps its old quote shape.
+    const legacy = insertLegacyMessage(app, { conversationId: conv.id, senderId: bob.user.id, body: 'old text', createdAt: clock() });
+    const toLegacy = await send(app, alice, conv.id, 'answer', { replyToId: legacy.id });
+    assert.deepEqual(toLegacy.replyTo, { id: legacy.id, senderId: bob.user.id, deleted: false });
+    const legacyReply = insertLegacyMessage(app, { conversationId: conv.id, senderId: bob.user.id, body: 're', replyToId: legacy.id, createdAt: clock() });
+    assert.deepEqual(legacyReply.replyTo, { id: legacy.id, senderId: bob.user.id, body: 'old text', attachmentKind: null, deleted: false });
 
     const other = await dm(app, bob, carol);
     const elsewhere = await send(app, carol, other.id, 'secret');
     for (const replyToId of [elsewhere.id, 9999999, 0, -1, 'x', 1.5]) {
-      const res = await request(app, 'POST', `/api/conversations/${conv.id}/messages`, {
-        token: bob.token,
-        body: { clientId: crypto.randomUUID(), body: 'hi', replyToId },
-      });
+      const res = await postEncrypted(app, bob, conv.id, 'hi', { replyToId });
       assert.equal(res.status, 400, String(replyToId));
-      assert.ok(!JSON.stringify(res.body).includes('secret'));
+      assert.ok(!JSON.stringify(res.body).includes(elsewhere.e2ee.ct));
     }
   });
 
-  test('edit: sender only, text only, within 15 minutes; replies follow', async () => {
+  test('edit: encrypted, sender only, text only, within 15 minutes', async () => {
     const ws = await WsClient.connect(app, bob.token);
     try {
       const m = await send(app, alice, conv.id, 'teh plan');
@@ -172,53 +232,60 @@ describe('reactions, replies, edit, unsend', () => {
       await ws.next('message', (f) => f.message.id === reply.id);
 
       clock.advance(5 * MIN);
-      const res = await edit(alice, m.id, '  the plan  ');
-      assert.equal(res.status, 200);
-      assert.equal(res.body.message.id, m.id);
-      assert.equal(res.body.message.body, 'the plan');
-      assert.equal(res.body.message.editedAt, clock());
-      assert.equal(res.body.message.createdAt, m.createdAt);
+      const body = await actBody(alice, `edit:${m.id}`, { body: 'the plan' });
+      const res = await request(app, 'PATCH', url(conv.id, m.id), { token: alice.token, body });
+      assert.equal(res.status, 200, res.text);
+      const edited = res.body.message;
+      assert.equal(edited.id, m.id);
+      assert.deepEqual(edited.e2ee, body.e2ee);
+      assert.equal(edited.e2eeClientId, body.clientId);
+      assert.equal(edited.clientId, m.clientId);
+      assert.equal(edited.body, '');
+      assert.equal(edited.editedAt, clock());
+      assert.equal(edited.createdAt, m.createdAt);
       const ev = await ws.next('message', (f) => f.message.id === m.id);
-      assert.equal(ev.message.body, 'the plan');
-      assert.equal(ev.message.editedAt, clock());
-      // The reply's quote shows the new text and is re-sent too.
-      const replyEv = await ws.next('message', (f) => f.message.id === reply.id);
-      assert.equal(replyEv.message.replyTo.body, 'the plan');
+      assert.deepEqual(ev.message, edited);
+      // The reply's quote ({ id, senderId, deleted }) didn't change, so it isn't re-sent.
+      assert.ok(await ws.none('message', (f) => f.message.id === reply.id));
+      // The same edit again is a no-op.
+      assert.equal((await request(app, 'PATCH', url(conv.id, m.id), { token: alice.token, body })).status, 200);
+      assert.ok(await ws.none('message', (f) => f.message.id === m.id));
 
-      assert.equal((await edit(bob, m.id, 'hijack')).status, 403);
-      assert.equal((await edit(carol, m.id, 'hijack')).status, 403);
-      for (const body of ['', '   ', 'x'.repeat(4001), 42, null]) {
-        assert.equal((await edit(alice, m.id, body)).status, 400, JSON.stringify(body));
+      assert.equal((await edit(app, bob, conv.id, m.id, 'hijack')).status, 403);
+      assert.equal((await edit(app, carol, conv.id, m.id, 'hijack')).status, 403);
+      const plain = await request(app, 'PATCH', url(conv.id, m.id), { token: alice.token, body: { body: 'plaintext' } });
+      assert.equal(plain.status, 400);
+      assert.deepEqual(plain.body, { error: RELOAD });
+      for (const kind of ['message', `reaction:${m.id}`, `edit:${reply.id}`]) {
+        assert.equal((await request(app, 'PATCH', url(conv.id, m.id), { token: alice.token, body: await actBody(alice, kind) })).status, 400, kind);
       }
-      assert.equal((await edit(alice, m.id, 'y'.repeat(4000))).status, 200);
-      const unchanged = await edit(alice, m.id, 'y'.repeat(4000));
-      assert.equal(unchanged.status, 200);
 
-      const photo = await uploadOk(app, alice);
-      const photoMsg = await send(app, alice, conv.id, 'caption', { attachmentId: photo.id });
-      assert.equal((await edit(alice, photoMsg.id, 'new caption')).status, 400);
+      // Messages with files can't be edited (the edit payload has only text).
+      const file = await uploadEncrypted(app, alice);
+      const photoMsg = await send(app, alice, conv.id, 'caption', { attachmentIds: [file.id] });
+      assert.equal((await edit(app, alice, conv.id, photoMsg.id, 'new caption')).status, 400);
 
       // Exactly 15 minutes is still fine, a moment later is not.
       const late = await send(app, alice, conv.id, 'late');
       clock.advance(15 * MIN);
-      assert.equal((await edit(alice, late.id, 'late!')).status, 200);
+      assert.equal((await edit(app, alice, conv.id, late.id, 'late!')).status, 200);
       clock.advance(1);
-      const tooLate = await edit(alice, late.id, 'late!!');
+      const tooLate = await edit(app, alice, conv.id, late.id, 'late!!');
       assert.equal(tooLate.status, 409);
-      assert.equal((await listFor(alice)).find((x) => x.id === late.id).body, 'late!');
+      assert.equal(textOf((await listFor(alice)).find((x) => x.id === late.id)), 'late!');
     } finally {
       await ws.close();
     }
   });
 
-  test('unsend: sender only, within 24 hours, deletes files, clears reactions, marks quotes deleted', async () => {
+  test('unsend: sender only, within 24 hours, deletes all files, clears reactions, marks quotes deleted', async () => {
     const ws = await WsClient.connect(app, bob.token);
     try {
-      const thumb = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.jpeg), 'image/jpeg');
-      const video = await uploadOk(app, alice, mediaFile(MEDIA_HEADS.mp4), 'video/mp4', `?thumbnailId=${thumb.id}`);
-      const m = await send(app, alice, conv.id, 'oops', { attachmentId: video.id });
+      const video = await uploadEncrypted(app, alice);
+      const thumb = await uploadEncrypted(app, alice);
+      const m = await send(app, alice, conv.id, 'oops', { attachmentIds: [video.id, thumb.id] });
       await ws.next('message', (f) => f.message.id === m.id);
-      await react(bob, m.id, '😮');
+      await react(app, bob, conv.id, m.id, '😮');
       await ws.next('message', (f) => f.message.id === m.id);
       const reply = await send(app, bob, conv.id, 'what was that', { replyToId: m.id });
       await ws.next('message', (f) => f.message.id === reply.id);
@@ -235,37 +302,37 @@ describe('reactions, replies, edit, unsend', () => {
       const gone = res.body.message;
       assert.equal(gone.id, m.id);
       assert.equal(gone.body, '');
+      assert.equal(gone.e2ee, null);
       assert.equal(gone.attachment, null);
+      assert.deepEqual(gone.attachments, []);
       assert.deepEqual(gone.reactions, {});
+      assert.deepEqual(gone.reactionClientIds, {});
       assert.equal(gone.replyTo, null);
       assert.equal(gone.deletedAt, clock());
       assert.equal(gone.senderId, alice.user.id);
       for (const f of files) assert.ok(!fs.existsSync(f), f);
       assert.equal(app.store.getAttachment(video.id), null);
       assert.equal(app.store.getAttachment(thumb.id), null);
+      assert.equal(app.store.db.prepare('SELECT COUNT(*) AS n FROM message_attachments WHERE message_id = ?').get(m.id).n, 0);
       for (const who of [alice, bob]) {
         assert.equal((await request(app, 'GET', `/api/attachments/${video.id}`, { token: who.token })).status, 404);
         assert.equal((await request(app, 'GET', `/api/attachments/${thumb.id}`, { token: who.token })).status, 404);
       }
       const ev = await ws.next('message', (f) => f.message.id === m.id);
       assert.equal(ev.message.deletedAt, clock());
-      assert.equal(ev.message.attachment, null);
+      assert.equal(ev.message.e2ee, null);
       const replyEv = await ws.next('message', (f) => f.message.id === reply.id);
-      assert.deepEqual(replyEv.message.replyTo, { id: m.id, senderId: alice.user.id, body: '', attachmentKind: null, deleted: true });
+      assert.deepEqual(replyEv.message.replyTo, { id: m.id, senderId: alice.user.id, deleted: true });
       const listed = await listFor(bob);
       assert.equal(listed.find((x) => x.id === m.id).deletedAt, clock());
       assert.equal(listed.find((x) => x.id === reply.id).replyTo.deleted, true);
 
       // Unsending again is harmless; nothing else can be done to it.
       assert.equal((await unsend(alice, m.id)).status, 200);
-      assert.equal((await react(bob, m.id, '👍')).status, 400);
+      assert.equal((await react(app, bob, conv.id, m.id, '👍')).status, 400);
       assert.equal((await unreact(bob, m.id)).status, 400);
-      assert.equal((await edit(alice, m.id, 'back')).status, 400);
-      const replyToGone = await request(app, 'POST', `/api/conversations/${conv.id}/messages`, {
-        token: bob.token,
-        body: { clientId: crypto.randomUUID(), body: 'hm', replyToId: m.id },
-      });
-      assert.equal(replyToGone.status, 400);
+      assert.equal((await edit(app, alice, conv.id, m.id, 'back')).status, 400);
+      assert.equal((await postEncrypted(app, bob, conv.id, 'hm', { replyToId: m.id })).status, 400);
 
       // A reply can itself be unsent; its quote goes away.
       const r2 = await send(app, bob, conv.id, 'nvm', { replyToId: reply.id });
@@ -279,7 +346,7 @@ describe('reactions, replies, edit, unsend', () => {
       assert.equal((await unsend(alice, a.id)).status, 200);
       clock.advance(1);
       assert.equal((await unsend(alice, b.id)).status, 409);
-      assert.equal((await listFor(alice)).find((x) => x.id === b.id).body, 'b');
+      assert.equal(textOf((await listFor(alice)).find((x) => x.id === b.id)), 'b');
     } finally {
       await ws.close();
     }
@@ -294,13 +361,14 @@ describe('reactions, replies, edit, unsend', () => {
     assert.equal(pushes.length, 1);
     assert.equal((await convFor(dave, c.id)).unreadCount, 1);
 
-    await edit(alice, m.id, 'one!', c.id);
-    await react(alice, m.id, '🙏', c.id);
-    await react(dave, m.id, '❤️', c.id);
+    assert.equal((await edit(app, alice, c.id, m.id, 'one!')).status, 200);
+    assert.equal((await react(app, alice, c.id, m.id, '🙏')).status, 200);
+    assert.equal((await react(app, dave, c.id, m.id, '❤️')).status, 200);
     const m2 = await send(app, alice, c.id, 'two');
     await app.push.idle();
     assert.equal(pushes.length, 2);
-    assert.equal(pushes[1].body, 'two');
+    assert.equal(pushes[1].messageId, m2.id);
+    assert.equal(textOf(pushes[1].e2ee), 'two');
     const dv = await convFor(dave, c.id);
     assert.equal(dv.unreadCount, 2);
     assert.equal(dv.lastMessage.id, m2.id);
@@ -335,11 +403,11 @@ describe('new routes: auth, membership and error hygiene', () => {
       ['PATCH', `/api/conversations/${g.id}`, { title: 'x' }],
       ['POST', `/api/conversations/${g.id}/members`, { userIds: [carol.user.id] }],
       ['DELETE', `/api/conversations/${g.id}/members/me`],
-      ['PUT', `/api/conversations/${g.id}/messages/${m.id}/reaction`, { emoji: '👍' }],
+      ['PUT', `/api/conversations/${g.id}/messages/${m.id}/reaction`, { clientId: 'r', e2ee: await makeEnvelope(app, alice, g.id, { kind: `reaction:${m.id}` }) }],
       ['DELETE', `/api/conversations/${g.id}/messages/${m.id}/reaction`],
-      ['PATCH', `/api/conversations/${g.id}/messages/${m.id}`, { body: 'x' }],
+      ['PATCH', `/api/conversations/${g.id}/messages/${m.id}`, { clientId: 'e', e2ee: await makeEnvelope(app, alice, g.id, { kind: `edit:${m.id}` }) }],
       ['DELETE', `/api/conversations/${g.id}/messages/${m.id}`],
-      ['POST', `/api/conversations/${g.id}/messages`, { clientId: 'r1', body: 'x', replyToId: m.id }],
+      ['POST', `/api/conversations/${g.id}/messages`, { clientId: 'r1', e2ee: await makeEnvelope(app, alice, g.id), replyToId: m.id }],
     ];
     for (const [method, p, body] of routes) {
       assert.equal((await request(app, method, p, { body })).status, 401, `${method} ${p} anon`);
@@ -348,7 +416,7 @@ describe('new routes: auth, membership and error hygiene', () => {
     }
     // Nothing changed.
     const msgs = (await request(app, 'GET', `/api/conversations/${g.id}/messages`, { token: alice.token })).body.messages;
-    assert.deepEqual(msgs.map((x) => [x.id, x.body, x.reactions]), [[m.id, 'hi', {}]]);
+    assert.deepEqual(msgs.map((x) => [x.id, textOf(x), x.e2ee, x.reactions, x.editedAt]), [[m.id, 'hi', m.e2ee, {}, null]]);
     for (const [method, p] of [
       ['POST', '/api/uploads'],
       ['GET', '/api/uploads/up_x'],
@@ -369,11 +437,13 @@ describe('new routes: auth, membership and error hygiene', () => {
       ['PATCH', `/api/conversations/${g.id}/messages/${m.id}`],
       ['POST', `/api/conversations/${g.id}/members`],
       ['POST', '/api/uploads'],
+      ['POST', `/api/conversations/${g.id}/messages`],
+      ['PUT', '/api/keys'],
     ]) {
       const bad = await request(app, method, p, { token: alice.token, body: '{"nope', headers: { 'Content-Type': 'application/json' } });
       assert.equal(bad.status, 400, p);
       assert.ok(!/at .*\.js/.test(bad.text), p);
-      const big = await request(app, method, p, { token: alice.token, body: JSON.stringify({ x: 'y'.repeat(70 * 1024) }) });
+      const big = await request(app, method, p, { token: alice.token, body: JSON.stringify({ x: 'y'.repeat(90 * 1024) }) });
       assert.equal(big.status, 413, p);
     }
   });

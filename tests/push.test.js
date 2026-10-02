@@ -6,7 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { startApp, request, register, dm, send, WsClient, PNG_BYTES } = require('./helpers');
+const { startApp, request, register, dm, send, postEncrypted, makeEnvelope, uploadEncrypted, WsClient } = require('./helpers');
+const { pushPayload, MAX_PUSH_PAYLOAD_BYTES } = require('../server/push');
 
 function fakeSubscription(name) {
   return {
@@ -96,13 +97,21 @@ describe('push notifications', () => {
     const msg = await send(app, a, g.id, 'Hello there');
     await app.push.idle();
     assert.deepEqual(sent.map((s) => s.endpoint).sort(), [subB1.endpoint, subB2.endpoint].sort());
-    assert.deepEqual(sent[0].payload, { title: 'Alice A', body: 'Hello there', conversationId: g.id });
+    assert.deepEqual(sent[0].payload, {
+      conversationId: g.id,
+      messageId: msg.id,
+      senderId: a.user.id,
+      clientId: msg.clientId,
+      title: 'Alice A',
+      e2ee: msg.e2ee,
+    });
+    assert.ok(!('body' in sent[0].payload));
     assert.deepEqual(sent[0].subscription.keys, subB1.endpoint === sent[0].endpoint ? subB1.keys : subB2.keys);
     assert.ok(msg.id);
     await cSocket.close();
   });
 
-  test('group title is used, long text truncated, photo preview', async () => {
+  test('group title is used; the envelope is included only while the payload stays <= 3000 bytes', async () => {
     const a = await register(app);
     const b = await register(app);
     const sub = fakeSubscription('b');
@@ -110,19 +119,51 @@ describe('push notifications', () => {
     const g = (
       await request(app, 'POST', '/api/conversations', { token: a.token, body: { memberIds: [b.user.id], title: 'Family' } })
     ).body.conversation;
-    await send(app, a, g.id, 'z'.repeat(500));
+    const file = await uploadEncrypted(app, a);
+    const small = await send(app, a, g.id, 'z'.repeat(500), { attachmentIds: [file.id] });
     await app.push.idle();
     assert.equal(sent.length, 1);
     assert.equal(sent[0].payload.title, 'Family');
-    assert.ok(sent[0].payload.body.length <= 100);
+    assert.deepEqual(sent[0].payload.e2ee, small.e2ee);
+    assert.ok(!('attachments' in sent[0].payload));
 
+    // A big envelope (a long message, many recipients) is left out; the app shows "New message".
     sent = [];
-    const att = (
-      await request(app, 'POST', '/api/attachments', { token: a.token, raw: PNG_BYTES, headers: { 'Content-Type': 'image/png' } })
-    ).body.attachment;
-    await send(app, a, g.id, '', { attachmentId: att.id });
+    const e2ee = await makeEnvelope(app, a, g.id);
+    e2ee.ct = crypto.randomBytes(3000).toString('base64url');
+    const res = await request(app, 'POST', `/api/conversations/${g.id}/messages`, { token: a.token, body: { clientId: crypto.randomUUID(), e2ee } });
+    assert.equal(res.status, 201);
     await app.push.idle();
-    assert.equal(sent[0].payload.body, 'Photo');
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].payload, {
+      conversationId: g.id,
+      messageId: res.body.message.id,
+      senderId: a.user.id,
+      clientId: res.body.message.clientId,
+      title: 'Family',
+    });
+  });
+
+  test('push payload size boundary: exactly 3000 bytes keeps the envelope, 3001 drops it', () => {
+    assert.equal(MAX_PUSH_PAYLOAD_BYTES, 3000);
+    const message = (ct) => ({
+      id: 7,
+      conversationId: 'c_x',
+      senderId: 'u_x',
+      clientId: 'k',
+      e2ee: { v: 1, kind: 'message', senderKeyId: 'K'.repeat(43), eph: 'e', iv: 'i', ct, keys: {}, sig: 's' },
+    });
+    const sizeWith = (n) => Buffer.byteLength(JSON.stringify({ conversationId: 'c_x', messageId: 7, senderId: 'u_x', clientId: 'k', title: 'Zoë', e2ee: message('A'.repeat(n)).e2ee }));
+    const n = 3000 - sizeWith(0);
+    assert.equal(sizeWith(n), 3000);
+    const fits = JSON.parse(pushPayload(message('A'.repeat(n)), 'Zoë'));
+    assert.equal(fits.e2ee.ct.length, n);
+    assert.equal(Buffer.byteLength(pushPayload(message('A'.repeat(n)), 'Zoë')), 3000);
+    const over = JSON.parse(pushPayload(message('A'.repeat(n + 1)), 'Zoë'));
+    assert.deepEqual(over, { conversationId: 'c_x', messageId: 7, senderId: 'u_x', clientId: 'k', title: 'Zoë' });
+    // Multi-byte titles count in bytes, not characters.
+    const emojiTitle = JSON.parse(pushPayload(message('A'.repeat(n - 1)), 'Zoë😀'));
+    assert.equal(emojiTitle.e2ee, undefined);
   });
 
   test('404/410 subscriptions are deleted; other failures keep them and never fail the POST', async () => {
@@ -139,10 +180,7 @@ describe('push notifications', () => {
       throw err;
     };
     const c = await dm(app, a, b);
-    const res = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: a.token,
-      body: { clientId: crypto.randomUUID(), body: 'hi' },
-    });
+    const res = await postEncrypted(app, a, c.id, 'hi');
     assert.equal(res.status, 201);
     await app.push.idle();
     assert.equal(sent.length, 2);
@@ -153,10 +191,7 @@ describe('push notifications', () => {
     respond = () => {
       throw new Error('boom');
     };
-    const res2 = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: a.token,
-      body: { clientId: crypto.randomUUID(), body: 'again' },
-    });
+    const res2 = await postEncrypted(app, a, c.id, 'again');
     assert.equal(res2.status, 201);
     await app.push.idle();
   });

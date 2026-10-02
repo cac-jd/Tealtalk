@@ -71,6 +71,8 @@ async function createApp(options = {}) {
     log,
   });
   const rateLimiter = new RateLimiter(options.rateLimit || { max: 20, windowMs: 10 * 60 * 1000 });
+  // Publishing a new key: at most 5 per user per day (docs/E2EE.md).
+  const keysRateLimiter = new RateLimiter(options.keysRateLimit || { max: 5, windowMs: 24 * 60 * 60 * 1000 });
   const now = typeof options.now === 'function' ? options.now : Date.now;
   const rawSignupCode = options.signupCode === undefined ? process.env.SIGNUP_CODE : options.signupCode;
   const signupCode = typeof rawSignupCode === 'string' && rawSignupCode.trim() ? rawSignupCode.trim() : null;
@@ -105,6 +107,7 @@ async function createApp(options = {}) {
     staticHandler: createStaticHandler(options.publicDir || DEFAULT_PUBLIC_DIR),
     uploadsDir,
     rateLimiter,
+    keysRateLimiter,
     trustProxy: options.trustProxy ?? process.env.TRUST_PROXY === '1',
     maxUploadBytes: Math.floor(maxUploadMb * 1024 * 1024),
     now,
@@ -134,6 +137,7 @@ async function createApp(options = {}) {
     sweeper.close();
     await hub.close();
     rateLimiter.close();
+    keysRateLimiter.close();
     store.close();
     throw err;
   }
@@ -156,6 +160,7 @@ async function createApp(options = {}) {
           push.close();
           sweeper.close();
           rateLimiter.close();
+          keysRateLimiter.close();
           await hub.close();
           await new Promise((resolve) => {
             server.close(() => resolve());

@@ -84,7 +84,9 @@ export async function api(path, { method = 'GET', body, raw, contentType, auth =
     const message =
       (data && typeof data.error === 'string' && data.error) ||
       (res.status === 413 ? 'That file is too large.' : `Request failed (${res.status}).`);
-    throw new ApiError(res.status, message);
+    const err = new ApiError(res.status, message);
+    err.data = data; // e.g. 409 { error: "members_changed", members } for encrypted sends
+    throw err;
   }
   return data;
 }
@@ -123,26 +125,32 @@ export const Api = {
     if (before) params.set('before', String(before));
     return api(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
   },
-  sendMessage: (id, { clientId, body, attachmentId, replyToId }) => {
-    const payload = { clientId };
-    if (body) payload.body = body;
-    if (attachmentId) payload.attachmentId = attachmentId;
+  /** An encrypted message: `e2ee` is the envelope (docs/E2EE.md). */
+  sendMessage: (id, { clientId, e2ee, attachmentIds, replyToId }) => {
+    const payload = { clientId, e2ee };
+    if (attachmentIds && attachmentIds.length) payload.attachmentIds = attachmentIds;
     if (replyToId) payload.replyToId = replyToId;
     return api(`/api/conversations/${encodeURIComponent(id)}/messages`, {
       method: 'POST',
       body: payload,
     });
   },
-  react: (id, msgId, emoji) =>
-    api(`${messagePath(id, msgId)}/reaction`, { method: 'PUT', body: { emoji } }),
+  react: (id, msgId, { clientId, e2ee }) =>
+    api(`${messagePath(id, msgId)}/reaction`, { method: 'PUT', body: { clientId, e2ee } }),
   unreact: (id, msgId) => api(`${messagePath(id, msgId)}/reaction`, { method: 'DELETE' }),
-  editMessage: (id, msgId, body) => api(messagePath(id, msgId), { method: 'PATCH', body: { body } }),
+  editMessage: (id, msgId, { clientId, e2ee }) =>
+    api(messagePath(id, msgId), { method: 'PATCH', body: { clientId, e2ee } }),
   unsendMessage: (id, msgId) => api(messagePath(id, msgId), { method: 'DELETE' }),
   markRead: (id, messageId) =>
     api(`/api/conversations/${encodeURIComponent(id)}/read`, {
       method: 'POST',
       body: { messageId },
     }),
+  myKeys: () => api('/api/keys/me'),
+  putKeys: (bundle, backup) => api('/api/keys', { method: 'PUT', body: { bundle, backup } }),
+  keysFor: (userIds) => api(`/api/keys?userIds=${userIds.map(encodeURIComponent).join(',')}`),
+  userKey: (userId, keyId) =>
+    api(`/api/keys/${encodeURIComponent(userId)}?keyId=${encodeURIComponent(keyId)}`),
   pushPublicKey: () => api('/api/push/public-key'),
   pushSubscribe: (subscription) =>
     api('/api/push/subscribe', { method: 'POST', body: { subscription } }),

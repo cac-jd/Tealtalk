@@ -23,7 +23,23 @@ import {
   conversationTitle,
   messageSummary,
   removeConversation,
+  emit,
+  setViewProvider,
 } from './js/store.js';
+import {
+  loadKeys,
+  getKeyState,
+  keysReady,
+  forgetKeys,
+  deleteLocalKeys,
+  handleKeysEvent,
+  messageView,
+  viewReady,
+  retryPending,
+} from './js/e2ee.js';
+import { releaseMedia } from './js/securemedia.js';
+import { initKeys, renderKeySetup, showRecoveryKey, showRecoveryEntry } from './js/ui/keys.js';
+import { initSafety, openSafetyScreen, closeSafetyScreen } from './js/ui/safety.js';
 import { loadOutbox, clearOutbox, flush } from './js/outbox.js';
 import { registerServiceWorker, disableNotifications } from './js/pwa.js';
 import { initAuth, showAuth } from './js/ui/auth.js';
@@ -45,6 +61,10 @@ const $ = (id) => document.getElementById(id);
 
 const SCREENS = {
   auth: 'auth-screen',
+  keys: 'key-setup-screen',
+  recoveryKey: 'recovery-key-screen',
+  recovery: 'recovery-screen',
+  safety: 'safety-screen',
   chats: 'chats-screen',
   new: 'new-chat-screen',
   chat: 'chat-screen',
@@ -66,6 +86,8 @@ const socket = new Socket({
     refreshConversations();
     catchUp();
     flush();
+    retryPending(); // envelopes whose sender key couldn't be fetched while offline
+    if (getKeyState().state === 'error' && state.me) loadKeys(state.me);
   },
   onAuthFail: () => endSession(),
   onMessage: handleEvent,
@@ -93,6 +115,9 @@ function handleEvent(evt) {
       break;
     case 'presence':
       setPresence(evt.userId, !!evt.online);
+      break;
+    case 'keys':
+      handleKeysEvent(evt.userId, evt.bundle);
       break;
     default:
       break;
@@ -127,10 +152,11 @@ async function handleIncoming(message) {
   clearTyping(convId, message.senderId);
   const conv = getConversation(convId);
   const who = userName(conv, message.senderId);
-  const text = messageSummary(conv, message);
 
   if (isChatVisible(convId)) {
     maybeMarkRead();
+    await viewReady(message); // announce the decrypted text
+    const text = messageSummary(getConversation(convId), message);
     announce(message.system ? text : `${who}: ${text}`);
   } else {
     // System lines ("Jordan added Sam") aren't unread messages, on the server either.
@@ -185,8 +211,13 @@ function startSession() {
   renderConnection();
   socket.start();
   refreshConversations();
+  const cached = state.me;
+  if (cached) loadKeys(cached);
   Api.me()
-    .then(({ user }) => setMe(user))
+    .then(({ user }) => {
+      setMe(user);
+      if (!cached || cached.id !== user.id) loadKeys(user);
+    })
     .catch(() => {});
 }
 
@@ -198,6 +229,9 @@ function endSession() {
   clearOutbox();
   closeChat();
   closeNewChat();
+  closeSafetyScreen();
+  forgetKeys();
+  releaseMedia({ all: true });
   resetState();
   renderChats();
   renderConnection();
@@ -205,7 +239,10 @@ function endSession() {
   route();
 }
 
+const LOGOUT_WARNING = "You'll need your recovery key to read your messages after logging back in.";
+
 async function logout() {
+  if (keysReady() && !window.confirm(`${LOGOUT_WARNING}\n\nLog out now?`)) return;
   const button = $('logout-button');
   button.disabled = true;
   await disableNotifications();
@@ -214,6 +251,7 @@ async function logout() {
   } catch {
     /* token is dropped locally either way */
   }
+  await deleteLocalKeys(); // this device's keys go with the session
   button.disabled = false;
   endSession();
 }
@@ -240,15 +278,40 @@ function route() {
   // A token can appear without a reload (e.g. set by another tab).
   if (!sessionStarted) startSession();
   const hash = location.hash || '#/';
-  const chatMatch = hash.match(/^#\/c\/([^/?#]+)(?:\/(info|add))?$/);
+
+  // No usable key on this device yet: set up, show the recovery key, or ask for it.
+  const keyState = getKeyState().state;
+  if (keyState !== 'ready') {
+    closeChat();
+    closeGroupInfo();
+    closeNewChat();
+    closeSafetyScreen();
+    if (keyState === 'needs-recovery') {
+      if (current !== 'recovery') showRecoveryEntry();
+      showScreen('recovery');
+    } else if (keyState === 'show-recovery') {
+      showRecoveryKey({ settings: false });
+      showScreen('recoveryKey');
+    } else {
+      renderKeySetup();
+      showScreen('keys');
+    }
+    return;
+  }
+
+  const chatMatch = hash.match(/^#\/c\/([^/?#]+)(?:\/(info|add|safety)(?:\/([^/?#]+))?)?$/);
   const sub = chatMatch ? chatMatch[2] || null : null;
   const isNew = hash === '#/new' || sub === 'add';
 
   if (!chatMatch || sub) closeChat();
   if (!chatMatch || sub !== 'info') closeGroupInfo();
+  if (!chatMatch || sub !== 'safety') closeSafetyScreen();
   if (!isNew) closeNewChat();
 
-  if (chatMatch && sub === 'info') {
+  if (chatMatch && sub === 'safety' && chatMatch[3]) {
+    showScreen('safety');
+    openSafetyScreen(decodeURIComponent(chatMatch[1]), decodeURIComponent(chatMatch[3]));
+  } else if (chatMatch && sub === 'info') {
     showScreen('info');
     openGroupInfo(decodeURIComponent(chatMatch[1]));
   } else if (isNew) {
@@ -263,6 +326,9 @@ function route() {
   } else if (hash === '#/settings') {
     showScreen('settings');
     openSettings();
+  } else if (hash === '#/settings/recovery') {
+    showRecoveryKey({ settings: true });
+    showScreen('recoveryKey');
   } else {
     showScreen('chats');
     renderChats();
@@ -308,6 +374,20 @@ function boot() {
   initChat({ socket });
   initGroupInfo();
   initSettings({ onLogout: logout });
+  initKeys({ onLogout: logout });
+  initSafety();
+  setViewProvider(messageView);
+
+  on('keys-state', (st) => {
+    if (!sessionStarted) return;
+    if (st === 'ready') {
+      // Everything waiting on keys can now be decrypted and sent.
+      emit('conversations');
+      flush();
+    }
+    current = null;
+    route();
+  });
 
   on('connection', renderConnection);
   window.addEventListener('hashchange', route);

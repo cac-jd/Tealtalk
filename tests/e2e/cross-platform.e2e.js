@@ -28,6 +28,8 @@ const {
   messagesWithBody,
   register,
   login,
+  logout,
+  postSealed,
   openConversation,
   sendText,
   statusOf,
@@ -148,10 +150,15 @@ async function main() {
   const offlineQueued = 'Sorry, I was in a tunnel 🚇';
   const xssBody = '<img src=x onerror="window.__xss=1"><b>not bold</b>';
   const groupTitle = 'Hike <b>crew</b> & "friends"';
+  const recoveryKeys = {};
 
   try {
     await check('iPhone user and Android user can register', async () => {
-      await Promise.all([register(maya, app.url, 'maya', 'Maya'), register(jordan, app.url, 'jordan', 'Jordan')]);
+      [recoveryKeys.maya, recoveryKeys.jordan] = await Promise.all([
+        register(maya, app.url, 'maya', 'Maya'),
+        register(jordan, app.url, 'jordan', 'Jordan'),
+      ]);
+      assert(recoveryKeys.maya !== recoveryKeys.jordan, 'two accounts got the same recovery key');
     }, { critical: true });
 
     await check('Android user starts a 1:1 with the iPhone user', async () => {
@@ -259,18 +266,29 @@ async function main() {
       await img.waitFor({ timeout: 8000 });
       await until('image decoded on Android', () => img.evaluate((el) => el.complete && el.naturalWidth > 0));
       const src = await img.getAttribute('src');
-      assert(src && src.startsWith('/api/attachments/'), `unexpected image src ${src}`);
+      assert(src && src.startsWith('blob:'), `image src is not decrypted data: ${src}`);
       const mine = tid(maya, 'message-image');
-      await until('server copy shown on iPhone', () =>
-        mine.evaluate((el) => el.complete && el.naturalWidth > 0 && el.getAttribute('src').startsWith('/api/attachments/')));
+      const mineMsg = tid(maya, 'message').filter({ has: maya.getByTestId('message-image') });
+      await until('sent photo shown on iPhone', async () =>
+        /^\d+$/.test((await mineMsg.getAttribute('data-message-id')) || '') &&
+        mine.evaluate((el) => el.complete && el.naturalWidth > 0 && el.getAttribute('src').startsWith('blob:')));
       assert((await tid(jordan, 'message-image').count()) === 1, 'exactly one image on Android');
       const photoMsg = tid(jordan, 'message').filter({ has: jordan.getByTestId('message-image') });
       assert((await photoMsg.getAttribute('data-mine')) === 'false', 'photo is theirs on Android');
     });
 
-    await check('other users cannot read the attachment', async () => {
-      const src = await tid(jordan, 'message-image').getAttribute('src');
-      const id = src.split('?')[0].split('/').pop();
+    await check('other users cannot read the attachment; members only get the encrypted bytes', async () => {
+      const photoMsg = tid(jordan, 'message').filter({ has: jordan.getByTestId('message-image') });
+      const photoId = Number(await photoMsg.getAttribute('data-message-id'));
+      const ids = app.store.messageAttachmentIds(photoId);
+      assert(ids.length >= 1, 'no encrypted file on the photo message');
+      const id = ids[0];
+      const token = await jordan.evaluate(() => localStorage.getItem('tt.token'));
+      const member = await fetch(`${app.url}/api/attachments/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+      const stored = Buffer.from(await member.arrayBuffer());
+      assert(member.status === 200, `member got ${member.status}`);
+      assert(member.headers.get('content-type') === 'application/vnd.tealtalk.e2ee', `served as ${member.headers.get('content-type')}`);
+      assert(stored.length === png.length + 16 && !stored.includes(png.subarray(16, 48)), 'server copy is not the encrypted photo');
       const outsider = await fetch(`${app.url}/api/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -376,19 +394,13 @@ async function main() {
     await check('catching up a busy group after a long time offline leaves no hole in the history', async () => {
       await tid(sam, 'new-chat-back').click();
       await tid(sam, 'chats-screen').waitFor();
-      const token = await jordan.evaluate(() => localStorage.getItem('tt.token'));
-      const post = (body) =>
-        fetch(`${app.url}/api/conversations/${groupId}/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ clientId: `bulk-${body}`, body }),
-        }).then((r) => assert(r.status === 201, `bulk send ${r.status}`));
+      // Jordan's other device sends (encrypted with his key, straight to the API).
       await narrow.context.setOffline(true);
       await until('Sam offline', async () => (await text(tid(sam, 'connection-status'))) === 'Offline', 5000);
-      for (let i = 1; i <= 60; i++) await post(`Photo dump ${i} of 60`);
+      await postSealed(jordan, groupId, Array.from({ length: 60 }, (_, i) => `Photo dump ${i + 1} of 60`));
       await narrow.context.setOffline(false);
       await tid(sam, 'connection-status').waitFor({ state: 'hidden', timeout: 10000 });
-      await post('Anyone still awake?'); // arrives live, before Sam opens the group
+      await postSealed(jordan, groupId, ['Anyone still awake?']); // arrives live, before Sam opens the group
       const badge = sam.locator(`[data-testid="conversation-item"][data-conversation-id="${groupId}"] [data-testid="unread-badge"]`);
       await until('unread badge for the catch-up', async () => Number(await text(badge)) >= 61);
       await openConversation(sam, groupId);
@@ -416,6 +428,7 @@ async function main() {
       await sleep(300);
       await tab.close();
 
+      const lastBefore = app.store.db.prepare('SELECT MAX(id) AS id FROM messages').get().id;
       await setAndroidOffline(true);
       await until('Offline banner', async () => (await text(tid(jordan, 'connection-status'))) === 'Offline', 5000);
       await sendText(maya, offlineIncoming);
@@ -443,7 +456,10 @@ async function main() {
         assert((await countWithBody(page, offlineQueued)) === 1, `queued message duplicated on ${label}`);
         assert((await countWithBody(page, offlineIncoming)) === 1, `incoming message duplicated on ${label}`);
       }
-      const stored = app.store.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE body = ?').get(offlineQueued).n;
+      const me = await jordan.evaluate(async () => (await import('/js/store.js')).state.me.id);
+      const stored = app.store.db
+        .prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ? AND sender_id = ? AND id > ?')
+        .get(dmId, me, lastBefore).n;
       assert(stored === 1, `server stored the queued message ${stored} times`);
     });
 
@@ -476,7 +492,7 @@ async function main() {
       await maya.reload();
       await tid(maya, 'chat-screen').waitFor();
       await until('history restored', async () => (await tid(maya, 'message').count()) === before);
-      assert((await tid(maya, 'message-image').count()) === 1, 'photo still there');
+      await until('photo still there (decrypted again after the reload)', async () => (await tid(maya, 'message-image').count()) === 1);
       await until('photo loads after reload', () =>
         tid(maya, 'message-image').evaluate((el) => el.complete && el.naturalWidth > 0));
       for (const body of [msg1, msg2, reply, offlineIncoming, offlineQueued]) {
@@ -538,24 +554,20 @@ async function main() {
     await check('logout clears the session; the next user on the device sees nothing of it', async () => {
       await tid(jordan, 'message-input').fill('draft only Jordan should ever see');
       await tid(jordan, 'back-button').click();
-      await tid(jordan, 'settings-button').click();
-      await tid(jordan, 'settings-screen').waitFor();
-      await tid(jordan, 'logout-button').click();
-      await tid(jordan, 'auth-screen').waitFor();
+      const warning = await logout(jordan);
+      assert(warning.includes('recovery key'), `no recovery-key warning before logout: "${warning}"`);
       const leftovers = await jordan.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('tt.')));
       assert(leftovers.length === 0, `localStorage still has ${leftovers.join(', ')}`);
       assert(await tid(jordan, 'chats-screen').isHidden(), 'chat list hidden after logout');
-      // Maya signs in on the same Android phone (no reload): her own messages are now "mine".
-      await login(jordan, 'maya');
+      // Maya signs in on the same Android phone (no reload): a new device for her, so it asks
+      // for her recovery key; then her own messages are "mine".
+      assert((await login(jordan, 'maya', { recoveryKey: recoveryKeys.maya })) === 'recovery', 'no recovery key asked on a new device');
       await openConversation(jordan, dmId);
       await until('history for Maya on Android', async () => (await countWithBody(jordan, reply)) === 1);
       assert((await messagesWithBody(jordan, reply).getAttribute('data-mine')) === 'true', 'Maya owns her message on a second device');
       assert((await messagesWithBody(jordan, msg1).getAttribute('data-mine')) === 'false', "Jordan's message is not Maya's");
       assert((await tid(jordan, 'message-input').inputValue()) === '', "previous user's draft leaked into the composer");
-      await tid(jordan, 'back-button').click();
-      await tid(jordan, 'settings-button').click();
-      await tid(jordan, 'logout-button').click();
-      await tid(jordan, 'auth-screen').waitFor();
+      await logout(jordan);
       await jordan.reload();
       await tid(jordan, 'auth-screen').waitFor();
       assert(await tid(jordan, 'chats-screen').isHidden(), 'still logged out after reload');

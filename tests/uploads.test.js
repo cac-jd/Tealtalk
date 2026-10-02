@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { startApp, request, register, dm, send, sleep, MEDIA_HEADS, mediaFile, uploadOk, fakeClock } = require('./helpers');
+const { startApp, request, register, dm, send, postEncrypted, sleep, MEDIA_HEADS, mediaFile, uploadOk, fakeClock, E2EE_MIME } = require('./helpers');
 
 const CHUNK = 5 * 1024 * 1024;
 
@@ -126,11 +126,28 @@ describe('resumable uploads', () => {
     assert.equal((await status(app, alice, id)).status, 404);
     assert.equal((await complete(app, alice, id)).status, 404);
 
+    // A plaintext video can't be sent any more (v3): only encrypted files.
     const c = await dm(app, alice, bob);
-    const msg = await send(app, alice, c.id, 'our trip', { attachmentId: att.id });
-    assert.equal(msg.attachment.kind, 'video');
+    assert.equal((await postEncrypted(app, alice, c.id, 'our trip', { attachmentIds: [att.id] })).status, 400);
+  });
+
+  test('encrypted files upload resumably with no magic-byte check, then send and play', async () => {
+    const bytes = Buffer.alloc(3000);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 11) % 256; // starts with 0x00: no known format
+    const id = await uploadAll(app, alice, E2EE_MIME, bytes);
+    const done = await complete(app, alice, id, { width: 1280, height: 720, durationMs: 4200, thumbnailId: 'a_whatever' });
+    assert.equal(done.status, 201, done.text);
+    const att = done.body.attachment;
+    assert.deepEqual(
+      { ...att, id: 'x' },
+      { id: 'x', mime: E2EE_MIME, size: 3000, kind: 'e2ee', width: null, height: null, durationMs: null, thumbnailId: null, expired: false }
+    );
+    const c = await dm(app, alice, bob);
+    const msg = await send(app, alice, c.id, 'our trip', { attachmentIds: [att.id] });
+    assert.deepEqual(msg.attachments, [{ id: att.id, size: 3000, expired: false }]);
     const res = await fetch(`${app.url}/api/attachments/${att.id}?token=${bob.token}`, { headers: { Range: 'bytes=2990-' } });
     assert.equal(res.status, 206);
+    assert.equal(res.headers.get('content-type'), E2EE_MIME);
     assert.deepEqual(Buffer.from(await res.arrayBuffer()), bytes.subarray(2990));
   });
 

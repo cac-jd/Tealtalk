@@ -4,7 +4,10 @@ import { Api } from '../api.js';
 import { h, clear, avatar } from '../dom.js';
 import { state, on, getConversation, upsertConversation, removeConversation, conversationTitle } from '../store.js';
 import { conversationAvatar } from './chats.js';
-import { toast, announce, backTo } from './common.js';
+import { toast, announce, backTo, icon } from './common.js';
+import { contactInfo } from '../e2ee.js';
+
+const SHIELD = 'M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5zm-1.4 14.6L7 13l1.4-1.4 2.2 2.2 5-5L17 10.2z';
 
 const $ = (id) => document.getElementById(id);
 
@@ -61,6 +64,24 @@ function render() {
           h('span', { class: 'username', text: `@${m.username}` }),
         ),
         !me && state.online.has(m.id) ? h('span', { class: 'online-dot', text: 'online' }) : null,
+        !me && contactInfo(m.id) && contactInfo(m.id).verified
+          ? h('span', { class: 'verified-badge', dataset: { testid: 'verified-badge', userId: m.id }, text: 'Verified' })
+          : null,
+        me
+          ? null
+          : h(
+              'button',
+              {
+                type: 'button',
+                class: 'icon-btn small member-safety',
+                dataset: { testid: 'verify-safety-button', userId: m.id },
+                'aria-label': `Safety number with ${m.displayName}`,
+                onclick: () => {
+                  location.hash = `#/c/${encodeURIComponent(convId)}/safety/${encodeURIComponent(m.id)}`;
+                },
+              },
+              icon(SHIELD),
+            ),
       ),
     );
   }
@@ -174,4 +195,5 @@ export function initGroupInfo() {
   on('conversation', refresh);
   on('presence', () => refresh());
   on('me', () => refresh());
+  on('safety', () => refresh());
 }

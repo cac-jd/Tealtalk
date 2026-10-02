@@ -3,7 +3,7 @@
 const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { startApp, request, register, dm, send } = require('./helpers');
+const { startApp, request, register, dm, send, makeEnvelope, textOf, RELOAD } = require('./helpers');
 
 describe('conversations and messages', () => {
   let app;
@@ -110,69 +110,72 @@ describe('conversations and messages', () => {
   test('post and list messages, shapes and validation', async () => {
     const c = await dm(app, alice, carol);
     const clientId = crypto.randomUUID();
+    const e2ee = await makeEnvelope(app, alice, c.id, { payload: { body: 'hello carol' } });
     const res = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
       token: alice.token,
-      body: { clientId, body: '  hello carol  ' },
+      body: { clientId, e2ee },
     });
-    assert.equal(res.status, 201);
+    assert.equal(res.status, 201, res.text);
     const m = res.body.message;
     assert.equal(typeof m.id, 'number');
     assert.equal(m.conversationId, c.id);
     assert.equal(m.senderId, alice.user.id);
     assert.equal(m.clientId, clientId);
-    assert.equal(m.body, 'hello carol');
+    assert.equal(m.body, '');
     assert.equal(m.attachment, null);
+    assert.deepEqual(m.attachments, []);
+    assert.deepEqual(m.e2ee, e2ee);
+    assert.equal(m.e2eeClientId, clientId);
+    assert.equal(textOf(m), 'hello carol');
     assert.ok(Math.abs(m.createdAt - Date.now()) < 5000);
 
+    const good = await makeEnvelope(app, alice, c.id);
     const bad = [
-      {},
-      { clientId: '', body: 'x' },
-      { clientId: 'x'.repeat(101), body: 'x' },
-      { clientId: crypto.randomUUID() },
-      { clientId: crypto.randomUUID(), body: '   ' },
-      { clientId: crypto.randomUUID(), body: 'x'.repeat(4001) },
-      { clientId: crypto.randomUUID(), body: 42 },
-      { clientId: crypto.randomUUID(), body: '', attachmentId: 'a_nope' },
+      { clientId: '', e2ee: good },
+      { clientId: 'x'.repeat(101), e2ee: good },
+      { e2ee: good },
+      { clientId: crypto.randomUUID(), e2ee: { ...good, kind: 'edit:1' } },
+      { clientId: crypto.randomUUID(), e2ee: 'nope' },
+      { clientId: crypto.randomUUID(), e2ee: good, attachmentIds: ['a_nope'] },
     ];
     for (const body of bad) {
       const r = await request(app, 'POST', `/api/conversations/${c.id}/messages`, { token: alice.token, body });
       assert.equal(r.status, 400, JSON.stringify(body).slice(0, 80));
     }
-    const max = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: alice.token,
-      body: { clientId: crypto.randomUUID(), body: 'y'.repeat(4000) },
-    });
-    assert.equal(max.status, 201);
+    // Old plaintext clients are told to reload.
+    for (const body of [{}, { clientId: crypto.randomUUID() }, { clientId: crypto.randomUUID(), body: 'hi' }, { clientId: 'x', body: '', attachmentId: 'a_1' }]) {
+      const r = await request(app, 'POST', `/api/conversations/${c.id}/messages`, { token: alice.token, body });
+      assert.equal(r.status, 400);
+      assert.deepEqual(r.body, { error: RELOAD });
+    }
+    const second = await send(app, alice, c.id, 'y'.repeat(4000));
 
     const list = await request(app, 'GET', `/api/conversations/${c.id}/messages`, { token: carol.token });
     assert.equal(list.status, 200);
-    assert.deepEqual(list.body.messages.map((x) => x.id), [m.id, max.body.message.id]);
+    assert.deepEqual(list.body.messages.map((x) => x.id), [m.id, second.id]);
     assert.deepEqual(list.body.messages[0], m);
 
     const conv = await request(app, 'GET', `/api/conversations/${c.id}`, { token: carol.token });
-    assert.equal(conv.body.conversation.lastMessage.id, max.body.message.id);
-    assert.equal(conv.body.conversation.updatedAt, max.body.message.createdAt);
+    assert.equal(conv.body.conversation.lastMessage.id, second.id);
+    assert.deepEqual(conv.body.conversation.lastMessage.e2ee, second.e2ee);
+    assert.equal(conv.body.conversation.updatedAt, second.createdAt);
   });
 
   test('clientId makes retries idempotent', async () => {
     const c = await dm(app, bob, dave);
     const clientId = crypto.randomUUID();
-    const one = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: bob.token,
-      body: { clientId, body: 'once' },
-    });
-    const two = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: bob.token,
-      body: { clientId, body: 'once' },
-    });
+    const post = async (who) =>
+      request(app, 'POST', `/api/conversations/${c.id}/messages`, {
+        token: who.token,
+        body: { clientId, e2ee: await makeEnvelope(app, who, c.id, { payload: { body: 'once' } }) },
+      });
+    const one = await post(bob);
+    const two = await post(bob);
     assert.equal(one.status, 201);
     assert.equal(two.status, 200);
     assert.deepEqual(two.body.message, one.body.message);
     // Same clientId from a different sender is a different message.
-    const other = await request(app, 'POST', `/api/conversations/${c.id}/messages`, {
-      token: dave.token,
-      body: { clientId, body: 'mine' },
-    });
+    const other = await post(dave);
     assert.equal(other.status, 201);
     const list = await request(app, 'GET', `/api/conversations/${c.id}/messages`, { token: bob.token });
     assert.equal(list.body.messages.length, 2);
@@ -229,7 +232,7 @@ describe('conversations and messages', () => {
     assert.deepEqual(list.body.conversations.map((c) => c.id), [c2.id, c1.id]);
     assert.equal(list.body.conversations[0].unreadCount, 2);
     assert.equal(list.body.conversations[1].unreadCount, 1);
-    assert.equal(list.body.conversations[0].lastMessage.body, 'mine does not count');
+    assert.equal(textOf(list.body.conversations[0].lastMessage), 'mine does not count');
 
     await new Promise((r) => setTimeout(r, 5));
     await send(app, frank, c1.id, 'bump');
@@ -288,8 +291,11 @@ describe('conversations and messages', () => {
     const c1 = await dm(app, carol, dave);
     const c2 = await dm(app, carol, bob);
     const clientId = crypto.randomUUID();
-    await request(app, 'POST', `/api/conversations/${c1.id}/messages`, { token: carol.token, body: { clientId, body: 'x' } });
-    const res = await request(app, 'POST', `/api/conversations/${c2.id}/messages`, { token: carol.token, body: { clientId, body: 'x' } });
+    await send(app, carol, c1.id, 'x', { clientId });
+    const res = await request(app, 'POST', `/api/conversations/${c2.id}/messages`, {
+      token: carol.token,
+      body: { clientId, e2ee: await makeEnvelope(app, carol, c2.id) },
+    });
     assert.equal(res.status, 409);
   });
 });

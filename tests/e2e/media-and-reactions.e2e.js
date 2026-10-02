@@ -5,12 +5,15 @@
 // full-resolution photos, big videos, voice messages, reactions, replies, edit,
 // unsend and group management, with identical styling on both phones.
 //
-//   npm run test:e2e        (runs cross-platform.e2e.js, then this file)
+//   npm run test:e2e        (runs cross-platform.e2e.js, this file, then encryption.e2e.js)
 //
 // Needs Playwright with Chromium. Starts its own server on a free port with a
 // fresh data dir and finds UI elements only through the data-testid contract in
 // docs/PROTOCOL.md. Media is made in-script: a JPEG with a GPS block, and a WebM
 // video (Playwright's Chromium can't decode H.264), padded past the 10 MB mark.
+// Everything is end-to-end encrypted (docs/E2EE.md): the server only ever has
+// application/vnd.tealtalk.e2ee bytes, so full quality is checked on the
+// decrypted blob: in the page that received it.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -33,6 +36,10 @@ const {
   text,
   messagesWithBody,
   register,
+  postSealed,
+  trackObjectUrls,
+  blobBytes,
+  blobInfo,
   conversationItem,
   openConversation,
   sendText,
@@ -49,6 +56,9 @@ process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = '1';
 const { check, summary } = createRunner();
 
 const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+const E2EE_MIME = 'application/vnd.tealtalk.e2ee';
+/** Encrypted size of a file: 16 bytes of tag per 256 KiB record (docs/E2EE.md "Files"). */
+const cipherSize = (size) => size + 16 * Math.max(1, Math.ceil(size / (256 * 1024)));
 
 // ---------------------------------------------------------------------------
 // page helpers (data-testid only)
@@ -165,23 +175,6 @@ async function main() {
     args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
   });
   const device = deviceFactory({ browser, serverHost, foreignRequests, consoleErrors, expectedError });
-  // Count live object URLs so a test can tell whether previews are released.
-  const trackObjectUrls = () => {
-    const live = new Set();
-    const create = URL.createObjectURL.bind(URL);
-    const revoke = URL.revokeObjectURL.bind(URL);
-    URL.createObjectURL = (obj) => {
-      const url = create(obj);
-      live.add(url);
-      return url;
-    };
-    URL.revokeObjectURL = (url) => {
-      live.delete(url);
-      return revoke(url);
-    };
-    window.__liveObjectUrls = () => live.size;
-  };
-
   const iphone = await device('iPhone', devices['iPhone 13'], { permissions: ['microphone'] });
   const android = await device('Android', devices['Pixel 7']);
   const narrow = await device('iPhone SE 320px', devices['iPhone SE']);
@@ -283,18 +276,20 @@ async function main() {
   let groupId = null;
   let photo = null; // { jpeg, stripped }
   let photoMsgId = null;
-  let photoUrls = null; // { thumb, full } paths
+  let photoUrls = null; // { thumb, full } blob: URLs of the decrypted thumbnail and original on Android
+  let photoIds = null; // [original, thumbnail] attachment ids on the server
   let video = null;
   let videoId = null;
 
   try {
     // ------------------------------------------------------------------ setup
     await check('iPhone, Android and 320px users register; Android starts a chat with the iPhone', async () => {
-      await Promise.all([
+      const keys = await Promise.all([
         register(maya, app.url, 'maya', 'Maya'),
         register(jordan, app.url, 'jordan', 'Jordan'),
         register(sam, app.url, 'sam', 'Sam'),
       ]);
+      assert(new Set(keys).size === 3, 'recovery keys are not unique');
       await tid(jordan, 'new-chat-button').click();
       await tid(jordan, 'user-search-input').fill('maya');
       await until('one search hit', async () => (await tid(jordan, 'user-result').count()) === 1);
@@ -308,7 +303,7 @@ async function main() {
     }, { critical: true });
 
     // ------------------------------------------------------------------ photo
-    await check('iPhone photo arrives at full size: same byte length, same bytes except the zeroed GPS block', async () => {
+    await check('iPhone photo arrives at full size: same byte length, same bytes except the zeroed GPS block (after decrypting)', async () => {
       const scratch = await browser.newPage();
       try {
         photo = withGpsExif(await canvasJpeg(scratch, { width: 2400, height: 1600 }));
@@ -330,17 +325,21 @@ async function main() {
       const thumbSrc = await img.getAttribute('src');
       await until('original loaded in the viewer', () =>
         viewerImg.evaluate((el, t) => el.getAttribute('src') !== t && el.complete && el.naturalWidth > 0, thumbSrc), 10000);
-      photoUrls = {
-        thumb: new URL(thumbSrc, app.url).pathname,
-        full: new URL(await viewerImg.getAttribute('src'), app.url).pathname,
-      };
-      const res = await get(jordan, photoUrls.full);
-      assert(res.status === 200, `original: ${res.status}`);
-      const stored = Buffer.from(await res.arrayBuffer());
-      assert(stored.length === photo.jpeg.length, `byte length ${stored.length} != sent ${photo.jpeg.length}`);
+      photoUrls = { thumb: thumbSrc, full: await viewerImg.getAttribute('src') };
+      assert(photoUrls.full.startsWith('blob:') && photoUrls.thumb.startsWith('blob:'), `not decrypted data: ${JSON.stringify(photoUrls)}`);
+      const got = await blobBytes(jordan, photoUrls.full);
+      assert(got.length === photo.jpeg.length, `byte length ${got.length} != sent ${photo.jpeg.length}`);
       let firstDiff = -1;
-      for (let i = 0; i < stored.length && firstDiff < 0; i++) if (stored[i] !== photo.stripped[i]) firstDiff = i;
+      for (let i = 0; i < got.length && firstDiff < 0; i++) if (got[i] !== photo.stripped[i]) firstDiff = i;
       assert(firstDiff < 0, `bytes differ from the original-minus-GPS at offset ${firstDiff}`);
+      // The server has the original and its thumbnail, encrypted.
+      photoIds = app.store.messageAttachmentIds(photoMsgId);
+      assert(photoIds.length === 2, `expected the photo and its thumbnail on the server, got ${photoIds.length}`);
+      const res = await get(jordan, `/api/attachments/${photoIds[0]}`);
+      const stored = Buffer.from(await res.arrayBuffer());
+      assert(res.status === 200 && res.headers.get('content-type') === E2EE_MIME, `original: ${res.status} ${res.headers.get('content-type')}`);
+      assert(stored.length === cipherSize(photo.jpeg.length), `stored ${stored.length} bytes, expected ${cipherSize(photo.jpeg.length)}`);
+      assert(!stored.includes(photo.stripped.subarray(4096, 4160)), 'the server copy contains plaintext photo bytes');
     });
 
     await check('the bubble shows a small thumbnail on both phones; image-viewer shows the full-resolution original', async () => {
@@ -351,10 +350,11 @@ async function main() {
       assert(full[0] === 2400 && full[1] === 1600, `viewer shows ${full.join('x')}, not 2400x1600`);
       await tid(jordan, 'image-viewer-close').click();
       await tid(jordan, 'image-viewer').waitFor({ state: 'hidden' });
+      await until('Android bubble keeps the decrypted thumbnail', async () =>
+        (await decoded(tid(jordan, 'message-image'))) && (await tid(jordan, 'message-image').getAttribute('src')) === photoUrls.thumb);
       for (const [page, label] of [[jordan, 'Android'], [maya, 'iPhone']]) {
         const img = tid(page, 'message-image');
-        await until(`server thumbnail on ${label}`, async () =>
-          (await decoded(img)) && new URL(await img.getAttribute('src'), app.url).pathname === photoUrls.thumb);
+        await until(`thumbnail on ${label}`, async () => (await decoded(img)) && (await img.getAttribute('src')).startsWith('blob:'));
         const [w, h] = await img.evaluate((el) => [el.naturalWidth, el.naturalHeight]);
         assert(Math.max(w, h) <= 480 && w > 0, `${label} bubble image is ${w}x${h}, not a thumbnail`);
       }
@@ -392,44 +392,60 @@ async function main() {
       assert(up.puts.length === chunks + 1, `expected ${chunks} chunks + 1 resend, saw PUT offsets ${up.puts.join(', ')}`);
     });
 
-    await check('after a dropped chunk the upload resumes where it stopped; the stored video is byte-identical', async () => {
+    await check('after a dropped chunk the upload resumes where it stopped; the decrypted video is byte-identical', async () => {
       assert(up.statusGets >= 1, 'did not ask the server how far it got');
       const chunk = 5 * 1024 * 1024;
       assert(JSON.stringify(up.puts) === JSON.stringify([0, chunk, chunk, 2 * chunk]),
         `PUT offsets ${up.puts.join(', ')} (expected a resend of the dropped chunk only)`);
-      const msg = tid(jordan, 'message').filter({ has: jordan.getByTestId('message-video') });
-      const src = await msg.getByTestId('message-video').getAttribute('src');
-      videoId = new URL(src, app.url).pathname.split('/').pop();
+      const msg = tid(maya, 'message').filter({ has: maya.getByTestId('message-video') });
+      [videoId] = app.store.messageAttachmentIds(await messageId(msg));
       const res = await get(jordan, `/api/attachments/${videoId}`);
       const stored = Buffer.from(await res.arrayBuffer());
-      assert(res.headers.get('content-type') === 'video/webm', `stored as ${res.headers.get('content-type')}`);
-      assert(stored.length === video.length && sha(stored) === sha(video), `stored ${stored.length} bytes differ from the ${video.length} sent`);
+      assert(res.headers.get('content-type') === E2EE_MIME, `stored as ${res.headers.get('content-type')}`);
+      assert(stored.length === cipherSize(video.length), `stored ${stored.length} bytes, expected ${cipherSize(video.length)}`);
+      assert(!stored.includes(video.subarray(0, 64)), 'the server copy starts like the plaintext video');
+      // What the iPhone decrypted is exactly what Android sent.
+      const src = await tid(maya, 'message-video').getAttribute('src');
+      assert(src && src.startsWith('blob:'), `video src is not decrypted data: ${src}`);
+      const got = await blobInfo(maya, src);
+      assert(got.type === 'video/webm', `decrypted video type ${got.type}`);
+      assert(got.size === video.length && got.sha256 === sha(video), `decrypted ${got.size} bytes differ from the ${video.length} sent`);
       const left = app.store.db.prepare('SELECT COUNT(*) AS n FROM uploads').get().n;
       assert(left === 0, `${left} unfinished uploads left on the server`);
     });
 
-    await check('the video plays inline on the iPhone, served as a 206 Range response', async () => {
+    await check('the video plays inline on the iPhone, downloaded once in full and decrypted', async () => {
       const v = tid(maya, 'message-video');
       assert((await v.getAttribute('playsinline')) !== null, 'video lacks playsinline');
       assert(await v.evaluate((el) => el.controls), 'video lacks controls');
-      assert(await v.getAttribute('poster'), 'video has no poster thumbnail');
       await v.evaluate((el) => {
         el.muted = true;
+        el.loop = true;
+        el.__playingSince = Date.now(); // marks this exact element
         return el.play();
       });
       await until('video playing', () => v.evaluate((el) => el.currentTime > 0.2 && el.videoWidth > 0), 10000);
+      // Regression: the chat re-render after a new message used to rebuild the decrypted
+      // player, which stopped the video.
+      const chat = 'Nice clip! 🎬';
+      await sendText(jordan, chat);
+      await until('message during playback', async () => (await countWithBody(maya, chat)) === 1);
+      await sleep(300);
+      const still = await v.evaluate((el) => ({ same: !!el.__playingSince, paused: el.paused }));
+      assert(still.same && !still.paused, `video interrupted by a new message: ${JSON.stringify(still)}`);
       await v.evaluate((el) => el.pause());
-      const ranged = iphoneMedia.filter((r) => r.url.includes(videoId) && r.status === 206);
-      assert(ranged.length > 0, `no 206 for the video: ${JSON.stringify(iphoneMedia.filter((r) => r.url.includes(videoId)).map((r) => r.status))}`);
-      const cr = ranged[0].headers['content-range'] || '';
-      assert(new RegExp(`^bytes \\d+-\\d+/${video.length}$`).test(cr), `Content-Range ${cr}`);
-      assert(ranged[0].headers['accept-ranges'] === 'bytes', 'no Accept-Ranges: bytes');
+      // Range streaming of encrypted video is a later improvement (docs/E2EE.md): one full download.
+      const fetched = iphoneMedia.filter((r) => r.url.includes(videoId));
+      assert(fetched.length === 1 && fetched[0].status === 200 && !fetched[0].range,
+        `video downloads: ${JSON.stringify(fetched.map((r) => [r.status, r.range]))}`);
+      assert(Number(fetched[0].headers['content-length']) === cipherSize(video.length), `Content-Length ${fetched[0].headers['content-length']}`);
+      assert(await v.getAttribute('poster'), 'video has no poster thumbnail');
       // Android's own copy is a player too.
       await tid(jordan, 'message-video').waitFor();
     });
 
     await check('cancelling an upload (even while the server is still creating it) leaves nothing behind', async () => {
-      const before = await jordan.evaluate(() => window.__liveObjectUrls());
+      const mark = await jordan.evaluate(() => window.__objectUrlMark());
       const messagesBefore = await tid(maya, 'message').count();
       // 1) Cancel while the upload is being created on the server.
       const create = gate();
@@ -452,8 +468,8 @@ async function main() {
       await sleep(300);
       assert((await tid(maya, 'message').count()) === messagesBefore, 'a cancelled video reached the iPhone');
       assert((await tid(jordan, 'message-video').count()) === 1, 'cancelled video bubble still on Android');
-      const after = await jordan.evaluate(() => window.__liveObjectUrls());
-      assert(after <= before, `object URLs leaked by cancelled uploads: ${before} -> ${after}`);
+      const leaked = await jordan.evaluate((m) => window.__liveObjectUrls(m), mark);
+      assert(leaked === 0, `${leaked} object URLs leaked by cancelled uploads`);
     });
 
     // ------------------------------------------------------------------ voice
@@ -468,14 +484,19 @@ async function main() {
       assert((await msg.getAttribute('data-mine')) === 'false', 'voice message is theirs on Android');
       const el = audio.locator('audio');
       await until('voice message metadata on Android', () => el.evaluate((a) => a.readyState >= 1 && !a.error), 8000);
-      const src = new URL(await el.getAttribute('src'), app.url).pathname;
-      const res = await get(jordan, src);
-      const type = res.headers.get('content-type') || '';
+      const src = await el.getAttribute('src');
+      assert(src && src.startsWith('blob:'), `voice message src is not decrypted data: ${src}`);
+      const { type, size } = await blobInfo(jordan, src);
+      assert(/^audio\/(mp4|webm|ogg|aac|mpeg)$/.test(type) && size > 0, `voice message decrypted as ${type} (${size} bytes)`);
+      const [voiceId] = app.store.messageAttachmentIds(await messageId(msg));
+      const res = await get(jordan, `/api/attachments/${voiceId}`);
       await res.arrayBuffer();
-      assert(/^audio\/(mp4|webm|ogg|aac|mpeg)$/.test(type), `voice message stored as ${type}`);
+      assert(res.headers.get('content-type') === E2EE_MIME, `voice message stored as ${res.headers.get('content-type')}`);
       assert(/[1-9]/.test(await text(audio)), `no duration shown: "${await text(audio)}"`);
-      await until('iPhone shows its own voice message from the server', async () =>
-        (await tid(maya, 'message-audio').locator('audio').getAttribute('src') || '').startsWith('/api/attachments/'));
+      const mine = tid(maya, 'message').filter({ has: maya.getByTestId('message-audio') });
+      await until('iPhone shows its own sent voice message', async () =>
+        /^\d+$/.test((await mine.getAttribute('data-message-id')) || '') &&
+        (await mine.getByTestId('message-audio').locator('audio').getAttribute('src') || '').startsWith('blob:'));
     });
 
     // ------------------------------------------------------------------ reactions
@@ -548,15 +569,8 @@ async function main() {
     await check('reply: quote shows on both phones and tapping it scrolls to the original', async () => {
       await sendText(maya, original);
       await until('original on Android', async () => (await countWithBody(jordan, original)) === 1);
-      const token = await tokenOf(jordan);
-      for (let i = 1; i <= 14; i++) {
-        const res = await fetch(`${app.url}/api/conversations/${dmId}/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ clientId: `filler-${i}`, body: `Packing list item ${i}` }),
-        });
-        assert(res.status === 201, `filler ${res.status}`);
-      }
+      // From Jordan's other device: sealed with his key, straight to the API.
+      await postSealed(jordan, dmId, Array.from({ length: 14 }, (_, i) => `Packing list item ${i + 1}`));
       await until('fillers on both', async () =>
         (await countWithBody(maya, 'Packing list item 14')) === 1 && (await countWithBody(jordan, 'Packing list item 14')) === 1);
       const originalId = await messageId(messagesWithBody(jordan, original));
@@ -626,12 +640,17 @@ async function main() {
         await tid(jordan, 'back-button').click();
         await tid(jordan, 'chats-screen').waitFor();
         const badge = conversationItem(jordan, dmId).getByTestId('unread-badge');
+        // The server can't read edits: "stored" means the message's envelope was replaced.
+        const envelopeOf = (id) => app.store.db.prepare('SELECT e2ee_client_id AS c FROM messages WHERE id = ?').get(id).c;
+        const editedId = await messageId(messagesWithBody(maya, edited));
+        let envelope = envelopeOf(editedId);
         await react(maya, messagesWithBody(maya, j1), '😂', 'long-press');
         await menuAction(maya, messagesWithBody(maya, edited), 'menu-edit', 'long-press');
         const again = 'Meet at the north trailhead at 7:15?';
         await tid(maya, 'message-input').fill(again);
         await tid(maya, 'send-button').click();
-        await until('edit stored', () => app.store.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE body = ?').get(again).n === 1);
+        await until('edit stored', () => envelopeOf(editedId) !== envelope);
+        envelope = envelopeOf(editedId);
         await sleep(700);
         assert((await badge.count()) === 0, 'unread badge after a reaction and an edit');
         // Same again on a freshly opened app, where the chat's history isn't loaded.
@@ -644,17 +663,19 @@ async function main() {
         await menuAction(maya, messagesWithBody(maya, again), 'menu-edit', 'long-press');
         await tid(maya, 'message-input').fill(third);
         await tid(maya, 'send-button').click();
-        await until('edit stored', () => app.store.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE body = ?').get(third).n === 1);
+        await until('edit stored', () => envelopeOf(editedId) !== envelope);
         await sleep(700);
         assert((await badge.count()) === 0, 'unread badge after a reaction and an edit to history not loaded yet');
         // A message sent and then unsent before Jordan saw it no longer counts.
         const oops = 'oops, wrong chat';
         await sendText(maya, oops);
         await until('badge 1 for a new message', async () => (await badge.count()) === 1 && (await text(badge)) === '1');
+        await until('oops has a server id', async () => /^\d+$/.test((await messagesWithBody(maya, oops).getAttribute('data-message-id')) || ''));
+        const oopsId = await messageId(messagesWithBody(maya, oops));
         await menuAction(maya, messagesWithBody(maya, oops), 'menu-unsend', 'long-press');
         await until('badge gone after unsend', async () => (await badge.count()) === 0, 5000);
-        const server = app.store.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE body = ? AND deleted_at IS NULL').get(oops).n;
-        assert(server === 0, 'unsend did not reach the server');
+        const row = app.store.db.prepare('SELECT deleted_at, e2ee FROM messages WHERE id = ?').get(oopsId);
+        assert(row.deleted_at && !row.e2ee, 'unsend did not reach the server (or kept the envelope)');
       } finally {
         // Back in the chat whatever happened, so the checks after this one start from there.
         if (await tid(jordan, 'chat-screen').isHidden()) await openConversation(jordan, dmId);
@@ -664,7 +685,7 @@ async function main() {
 
     // ------------------------------------------------------------------ unsend
     await check('unsend: message-unsent on both phones, and the photo and its thumbnail then 404', async () => {
-      assert(photoMsgId && photoUrls, 'no photo to unsend');
+      assert(photoMsgId && photoIds, 'no photo to unsend');
       const onMaya = messageById(maya, photoMsgId);
       await longPress(maya, onMaya.getByTestId('message-image'));
       await tid(maya, 'message-menu').waitFor({ state: 'visible' });
@@ -675,10 +696,10 @@ async function main() {
         assert((await msg.getByTestId('message-image').count()) === 0, `${label} still shows the photo`);
       }
       assert((await tid(jordan, 'message-image').count()) === 0, 'a photo is still on Android');
-      for (const p of [photoUrls.full, photoUrls.thumb]) {
-        const res = await get(jordan, p);
+      for (const id of photoIds) {
+        const res = await get(jordan, `/api/attachments/${id}`);
         await res.arrayBuffer();
-        assert(res.status === 404, `${p} -> ${res.status} after unsend`);
+        assert(res.status === 404, `${id} -> ${res.status} after unsend`);
       }
     });
 

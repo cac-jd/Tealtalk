@@ -4,9 +4,10 @@
 
 On most phones, who you can message and how well depends on which phone you and your friends bought. TealTalk ignores that. Everyone gets the same app, the same colours and the same features: read receipts, typing indicators, photos and group chats. Your messages are teal and everyone else's are grey, on every device.
 
+- **End-to-end encrypted.** Messages, photos, videos, voice messages, reactions and edits are locked on your phone and unlocked only on the recipients' phones. The server stores data it can't read. Safety numbers let you confirm nobody is listening in. See [docs/E2EE.md](docs/E2EE.md).
 - **No ads, no trackers, no analytics.** The app loads nothing from third parties: no CDNs, fonts or scripts from anyone else, backed by a strict Content-Security-Policy.
 - **Android and iPhone:** TealTalk is a Progressive Web App. Open it in the browser and add it to your home screen. It runs full screen like a native app, starts offline and gets push notifications. No app store is needed.
-- **You host it.** One small Node server with a single SQLite file. Your messages live on your server and nowhere else.
+- **You host it.** One small Node server with a single SQLite file. Your server only ever holds encrypted messages.
 
 | iPhone (Maya) | Android (Jordan) | Chats | Dark mode |
 | --- | --- | --- | --- |
@@ -57,12 +58,14 @@ See [docs/DEPLOY.md](docs/DEPLOY.md). It starts with a free way to try TealTalk 
 ```sh
 npm test            # server integration tests
 npm run test:e2e    # browser tests: an iPhone user and an Android user chatting, sending full-quality photos,
-                    # videos and voice messages, reacting, replying and running a group (needs Playwright + Chromium)
+                    # videos and voice messages, reacting, replying, running a group, and an encryption test
+                    # that scans the server's database and files for any readable content (needs Playwright + Chromium)
+npm run fingerprint # the app fingerprint to compare with Settings → About
 ```
 
 ## Known limitations (prototype)
 
-- Messages are protected in transit by HTTPS and stored unencrypted on your server. There's no end-to-end encryption yet.
+- Encryption limits are listed in [docs/E2EE.md](docs/E2EE.md). In short: the server still sees who talks to whom and when, plus group names. It delivers the app's code, so a hacked server could ship a tampered app. There's no forward secrecy yet. Save your recovery key, because without it a new phone can't read old messages.
 - The e2e test emulates the iPhone with Chromium's iPhone 13 profile. Real Safari on iOS has not been tested yet, particularly how the composer behaves when the keyboard opens.
 - A photo or video still uploading is lost if the app is closed before it finishes. Queued text messages are kept.
 - Real iPhone Safari behaviour still needs checking on a device: whether Safari's picker shrinks videos, AAC voice recording, and long-press menus.

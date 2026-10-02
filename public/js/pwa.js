@@ -109,3 +109,33 @@ export async function disableNotifications() {
     /* ignore */
   }
 }
+
+// ---- app fingerprint ----
+
+/**
+ * SHA-256 over the app's files as the service worker has them cached (same
+ * algorithm as `npm run fingerprint`), or null if there's no service worker yet.
+ */
+export async function appFingerprint() {
+  if (!('serviceWorker' in navigator)) return null;
+  try {
+    const reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]);
+    const worker = reg && reg.active;
+    if (!worker) return null;
+    return await new Promise((resolve) => {
+      const channel = new MessageChannel();
+      const timer = setTimeout(() => resolve(null), 30000);
+      channel.port1.onmessage = (event) => {
+        clearTimeout(timer);
+        const fp = event.data && event.data.fingerprint;
+        resolve(typeof fp === 'string' && /^[0-9a-f]{64}$/.test(fp) ? fp : null);
+      };
+      worker.postMessage({ type: 'fingerprint' }, [channel.port2]);
+    });
+  } catch {
+    return null;
+  }
+}

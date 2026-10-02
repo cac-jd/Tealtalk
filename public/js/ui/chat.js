@@ -1,8 +1,11 @@
 // An open conversation: message list, typing indicator, composer, and the
 // per-message actions (reactions, reply, edit, unsend, copy).
+//
+// Messages are end-to-end encrypted: what a bubble shows comes from the
+// decrypted view (e2ee.js), and reactions and edits are sent as envelopes.
 
 import { Api, attachmentUrl, getToken } from '../api.js';
-import { h, clear, dayKey, formatDay, formatTime, isTouchDevice } from '../dom.js';
+import { h, clear, dayKey, formatDay, formatTime, isTouchDevice, uuid } from '../dom.js';
 import {
   state,
   on,
@@ -10,10 +13,8 @@ import {
   getConversation,
   upsertConversation,
   addMessages,
-  replaceMessage,
   findMessage,
   liveNow,
-  arrivedLiveSince,
   sortedMessages,
   pendingFor,
   messageStatus,
@@ -27,8 +28,24 @@ import {
   kindLabel,
   systemText,
   messageSummary,
+  messageView,
 } from '../store.js';
-import { enqueue, retry, discard, canRetry, cancelUpload } from '../outbox.js';
+import { enqueue, retry, discard, canRetry, cancelUpload, safetyBlocked } from '../outbox.js';
+import {
+  sendSealed,
+  audienceGuess,
+  waitingText,
+  contactInfo,
+  safetyChanges,
+  memberNotices,
+  acknowledgeChange,
+  editPayload,
+  reactionPayload,
+  MissingKeysError,
+  SafetyCheckNeeded,
+  KeysNotReadyError,
+} from '../e2ee.js';
+import { cachedMediaUrl, loadMedia, releaseMedia } from '../securemedia.js';
 import { prepareImage } from '../images.js';
 import { prepareVideo, videoMime } from '../video.js';
 import { conversationAvatar, totalUnread } from './chats.js';
@@ -126,6 +143,8 @@ export async function openChat(id) {
   render({ forceBottom: true });
   maybeMarkRead();
   fillViewport();
+  const held = safetyBlocked(id);
+  if (held.length) showSafetyDialog(held);
   if (!isTouchDevice()) input.focus({ preventScroll: true });
 }
 
@@ -143,6 +162,8 @@ export function closeChat() {
   openSeq++;
   elements.clear();
   clear($('message-list'));
+  closeSafetyDialog();
+  releaseMedia(); // revoke decrypted photos/videos of this chat
   $('older-status').hidden = true;
   pinnedToBottom = true;
   lastScrollTop = 0;
@@ -289,12 +310,14 @@ function renderHeader() {
   clear(av);
   $('group-info-button').hidden = !(conv && conv.isGroup);
   if (!conv) {
+    renderSafetyHeader(null);
     title.textContent = 'Loading…';
     subtitle.textContent = '';
     return;
   }
   title.textContent = conversationTitle(conv);
   av.appendChild(conversationAvatar(conv, 'small'));
+  renderSafetyHeader(conv);
   if (conv.isGroup) {
     const n = (conv.members || []).length;
     subtitle.textContent = `${n} ${n === 1 ? 'member' : 'members'}`;
@@ -311,6 +334,29 @@ function renderHeader() {
     'aria-label',
     unreadElsewhere ? `Back to chats, ${unreadElsewhere} unread` : 'Back to chats',
   );
+}
+
+/**
+ * 1:1 chats: the safety-number button and the verified badge. (Testids are only
+ * set while shown, because group info lists the same testids per member.)
+ */
+function renderSafetyHeader(conv) {
+  const other = conv && !conv.isGroup ? otherMembers(conv)[0] : null;
+  const button = $('verify-safety-button');
+  const badge = $('chat-verified-badge');
+  button.hidden = !other;
+  if (other) {
+    button.dataset.testid = 'verify-safety-button';
+    button.dataset.userId = other.id;
+  } else {
+    delete button.dataset.testid;
+    delete button.dataset.userId;
+  }
+  const info = other && contactInfo(other.id);
+  const verified = !!(info && info.verified);
+  badge.hidden = !verified;
+  if (verified) badge.dataset.testid = 'verified-badge';
+  else delete badge.dataset.testid;
 }
 
 function renderTyping() {
@@ -357,18 +403,47 @@ function serverAttachment(att) {
   };
 }
 
+/**
+ * An encrypted attachment from a decrypted payload: the file is downloaded and
+ * decrypted on demand (or is already here, e.g. because I sent it from this device).
+ */
+function secureAttachment(a) {
+  if (a.expired) return { kind: a.kind, mime: a.mime, id: a.id, expired: true, pending: false };
+  const url = cachedMediaUrl(a.id);
+  const thumb = a.thumb;
+  return {
+    kind: a.kind,
+    mime: a.mime,
+    id: a.id,
+    size: a.size,
+    url,
+    thumbUrl: thumb ? cachedMediaUrl(thumb.id) : a.kind === 'image' ? url : null,
+    hasThumb: !!thumb,
+    thumbSize: thumb ? thumb.size : a.size, // what showing a preview downloads
+    load: (onProgress) => loadMedia(a, onProgress),
+    loadThumb: thumb ? () => loadMedia(thumb) : a.kind === 'image' ? () => loadMedia(a) : null,
+    width: a.width || null,
+    height: a.height || null,
+    durationMs: a.durationMs || null,
+    expired: false,
+    pending: false,
+  };
+}
+
 function pendingAttachment(p) {
   const m = p.media || { kind: 'image', mime: 'image/jpeg' };
-  const remote = p.attachmentId ? attachmentUrl(p.attachmentId) : null;
-  const remoteThumb = m.thumbnailId ? attachmentUrl(m.thumbnailId) : null;
-  let url = remote;
-  if (m.kind === 'image') url = remote || p.localUrl || null;
-  if (m.kind === 'audio') url = p.fileUrl || remote;
+  // Uploaded before a reload: the local previews are gone, but the keys are in the outbox.
+  if (!p.localUrl && !p.fileUrl && p.attachments && p.attachments[0]) {
+    return { ...secureAttachment({ ...p.attachments[0], expired: false }), pending: m.kind !== 'audio', uploading: false, progress: 1 };
+  }
+  let url = null;
+  if (m.kind === 'image') url = p.localUrl || null;
+  if (m.kind === 'audio') url = p.fileUrl || null;
   return {
     kind: m.kind,
     mime: m.mime,
     url,
-    thumbUrl: p.localUrl || remoteThumb || (m.kind === 'image' ? remote : null),
+    thumbUrl: p.localUrl || null,
     width: m.width,
     height: m.height,
     durationMs: m.durationMs,
@@ -379,17 +454,56 @@ function pendingAttachment(p) {
   };
 }
 
-/** A reply quote for a message still in the outbox (the server fills `replyTo` later). */
-function localReplyTo(id) {
+/** What a reply quotes: { id, senderId, snippet, deleted } from the message itself, if loaded. */
+function quoteOf(id) {
   const m = findMessage(convId, id);
-  if (!m) return { id, senderId: null, body: '', attachmentKind: null, deleted: false };
+  if (!m) return { id, senderId: null, snippet: '', deleted: false };
   return {
     id,
     senderId: m.senderId,
-    body: (m.body || '').slice(0, 200),
-    attachmentKind: m.attachment ? attachmentKind(m.attachment) : null,
+    snippet: messageSummary(getConversation(convId), m).slice(0, 200),
     deleted: !!m.deletedAt,
   };
+}
+
+/**
+ * The quote above a reply. When the quoted message is loaded here, the quote
+ * shows what it says now as this device decrypted it (edits included), never the
+ * replier's copy. Otherwise the snippet the replier put in their encrypted
+ * payload, marked as "quoted by sender".
+ */
+function replyModel(conv, m, view) {
+  const r = m.replyTo;
+  if (!r) return null;
+  if (!m.e2ee) {
+    const snippet = r.body || (r.attachmentKind ? kindLabel(r.attachmentKind) : '');
+    return { id: r.id, senderId: r.senderId, snippet, deleted: !!r.deleted };
+  }
+  const quoted = findMessage(convId, r.id);
+  if (quoted) {
+    return { id: r.id, senderId: quoted.senderId, snippet: messageSummary(conv, quoted), deleted: !!(r.deleted || quoted.deletedAt) };
+  }
+  const fromPayload = view.replyTo && view.replyTo.id === r.id ? view.replyTo : null;
+  return {
+    id: r.id,
+    senderId: r.senderId || null,
+    snippet: fromPayload ? fromPayload.snippet : '',
+    bySender: !!(fromPayload && fromPayload.snippet),
+    deleted: !!r.deleted,
+  };
+}
+
+function attachmentModel(view) {
+  if (view.attachments && view.attachments.length) return secureAttachment(view.attachments[0]);
+  if (view.legacyAttachment) return serverAttachment(view.legacyAttachment);
+  return null;
+}
+
+function blockedText(conv, p) {
+  if (!p.blocked) return '';
+  if (p.blocked.reason === 'keys') return waitingText(conv, p.blocked.userIds);
+  if (p.blocked.reason === 'safety') return 'Safety number changed. Tap to review.';
+  return '';
 }
 
 /** Normalise server and pending messages into one render model. */
@@ -401,23 +515,30 @@ function buildItems(conv) {
     }
     const mine = meId !== null && m.senderId === meId;
     const deleted = !!m.deletedAt;
+    const view = messageView(m);
+    const failed = view.status === 'unverified' || view.status === 'undecryptable' ? view.status : null;
     return {
       key: `m:${m.senderId}:${m.clientId || m.id}`,
       id: m.id,
       clientId: m.clientId || null,
       senderId: m.senderId,
       mine,
-      body: deleted ? '' : m.body || '',
-      attachment: !deleted && m.attachment ? serverAttachment(m.attachment) : null,
-      replyTo: deleted ? null : m.replyTo || null,
-      reactions: deleted ? {} : m.reactions || {},
+      body: deleted ? '' : view.body || '',
+      attachment: deleted ? null : attachmentModel(view),
+      replyTo: deleted ? null : replyModel(conv, m, view),
+      reactions: deleted ? {} : view.reactions || {},
       edited: !!m.editedAt && !deleted,
       deleted,
+      legacy: !deleted && view.status === 'legacy' && !view.warning,
+      warning: deleted ? null : view.warning || null,
+      decrypting: !deleted && view.status === 'pending',
+      undecryptable: deleted ? null : failed,
       createdAt: m.createdAt,
       status: mine && conv ? messageStatus(conv, m) : null,
       msg: m,
     };
   });
+  addSafetyNotices(conv, items);
   for (const p of pendingFor(convId)) {
     items.push({
       key: `m:${meId}:${p.clientId}`,
@@ -426,17 +547,51 @@ function buildItems(conv) {
       senderId: meId,
       mine: true,
       body: p.body || '',
-      attachment: p.media || p.attachmentId ? pendingAttachment(p) : null,
-      replyTo: p.replyToId ? localReplyTo(p.replyToId) : null,
+      attachment: p.media || p.attachments ? pendingAttachment(p) : null,
+      replyTo: p.replyToId ? replyOfPending(p) : null,
       reactions: {},
       edited: false,
       deleted: false,
+      waiting: p.state === 'failed' ? '' : blockedText(conv, p),
       createdAt: p.createdAt,
       status: p.state === 'failed' ? 'failed' : 'sending',
       pending: p,
     });
   }
   return items;
+}
+
+/** A pending reply's quote: the live original if loaded, else the snippet saved when replying. */
+function replyOfPending(p) {
+  const q = quoteOf(p.replyToId);
+  if (q.senderId || !(p.replyTo && p.replyTo.snippet)) return q;
+  return { ...q, senderId: p.replyTo.senderId || null, snippet: p.replyTo.snippet };
+}
+
+/**
+ * "Maya's safety number changed" notices, placed by time among the loaded
+ * messages, in every chat with that person. Plus "Sam was added to this chat"
+ * notices this device made when sealing to someone new in the chat.
+ */
+function addSafetyNotices(conv, items) {
+  if (!conv) return;
+  const meId = state.me && state.me.id;
+  const others = (conv.members || []).map((m) => m.id).filter((id) => id !== meId);
+  const changes = [
+    ...safetyChanges(others).map((c) => ({ ...c, type: 'safety' })),
+    ...memberNotices(convId).map((c) => ({ ...c, type: 'member' })),
+  ];
+  if (!changes.length) return;
+  const chat = getChat(convId);
+  const oldest = items.length ? items[0].createdAt : Infinity;
+  for (const c of changes.sort((a, b) => a.at - b.at)) {
+    if (chat.hasMore && c.at < oldest) continue; // shows up when scrolling back that far
+    const tag = c.type === 'member' ? 'mn' : 'n';
+    const notice = { key: `${tag}:${c.userId}:${c.at}`, notice: true, noticeType: c.type, userId: c.userId, senderId: `notice:${c.userId}:${c.at}`, createdAt: c.at };
+    let i = items.findIndex((it) => it.createdAt > c.at);
+    if (i < 0) i = items.length;
+    items.splice(i, 0, notice);
+  }
 }
 
 // ---------- message elements ----------
@@ -462,6 +617,55 @@ function systemEl(item, conv) {
   }
   const text = systemText(conv, item.msg);
   if (el.textContent !== text) el.textContent = text;
+  return el;
+}
+
+/** "Sam was added to this chat": made on this device, not by the server. */
+function memberNoticeEl(item, conv) {
+  let el = elements.get(item.key);
+  if (!el) {
+    el = h('div', {
+      class: 'system-message member-notice',
+      role: 'listitem',
+      dataset: { testid: 'member-change-notice', userId: item.userId },
+    });
+    elements.set(item.key, el);
+  }
+  const text = `${userName(conv, item.userId)} was added to this chat`;
+  const time = formatTime(item.createdAt);
+  if (el.dataset.sig !== text + time) {
+    el.dataset.sig = text + time;
+    el.replaceChildren(
+      h('span', { text }),
+      h('time', { class: 'notice-time', datetime: new Date(item.createdAt).toISOString(), text: ` · ${time}` }),
+    );
+  }
+  return el;
+}
+
+function noticeEl(item, conv) {
+  if (item.noticeType === 'member') return memberNoticeEl(item, conv);
+  let el = elements.get(item.key);
+  if (!el) {
+    el = h('button', {
+      type: 'button',
+      class: 'system-message safety-notice',
+      role: 'listitem',
+      dataset: { testid: 'safety-change-notice', userId: item.userId },
+      onclick: () => openSafety(item.userId),
+    });
+    elements.set(item.key, el);
+  }
+  const text = `${userName(conv, item.userId)}'s safety number changed`;
+  const time = formatTime(item.createdAt);
+  if (el.dataset.sig !== text + time) {
+    el.dataset.sig = text + time;
+    el.replaceChildren(
+      h('span', { text }),
+      h('time', { class: 'notice-time', datetime: new Date(item.createdAt).toISOString(), text: ` · ${time}` }),
+    );
+    el.setAttribute('aria-label', `${text} at ${time}. Show safety number`);
+  }
   return el;
 }
 
@@ -504,8 +708,12 @@ function contentSignature(item) {
   const r = item.replyTo;
   return [
     item.deleted ? 'deleted' : '',
-    a ? `${a.kind}:${a.expired}:${a.kind === 'image' ? '' : `${a.pending}:${a.url}`}` : '',
-    r ? `${r.id}:${r.deleted}:${r.senderId}:${r.body}:${r.attachmentKind}` : '',
+    item.undecryptable || (item.decrypting ? 'decrypting' : ''),
+    // An encrypted file (it has an id) loads itself into its element: its URL showing up once
+    // decrypted must not rebuild the bubble, which would stop a video or voice message playing.
+    a ? `${a.kind}:${a.expired}:${a.id || ''}:${a.kind === 'image' ? '' : a.id ? a.pending : `${a.pending}:${a.url}`}` : '',
+    r ? `${r.id}:${r.deleted}:${r.senderId}:${r.snippet}:${r.bySender ? 1 : 0}` : '',
+    item.warning ? `${item.warning}:${item.warning === 'unencrypted' ? item.senderId : ''}` : '',
   ].join('|');
 }
 
@@ -516,9 +724,7 @@ function senderLabel(conv, item) {
 function replyQuoteEl(conv, r) {
   const meId = state.me && state.me.id;
   const who = r.senderId === meId ? 'You' : r.senderId ? userName(conv, r.senderId) : '';
-  const snippet = r.deleted
-    ? 'This message was unsent'
-    : (r.body || '').replace(/\s+/g, ' ').trim() || (r.attachmentKind ? kindLabel(r.attachmentKind) : 'Message');
+  const snippet = r.deleted ? 'This message was unsent' : (r.snippet || '').replace(/\s+/g, ' ').trim() || 'Message';
   return h(
     'button',
     {
@@ -533,6 +739,9 @@ function replyQuoteEl(conv, r) {
     },
     who ? h('span', { class: 'reply-quote-name', text: who }) : null,
     h('span', { class: `reply-quote-text${r.deleted ? ' unsent' : ''}`, text: snippet }),
+    r.bySender && !r.deleted
+      ? h('span', { class: 'reply-quote-source', dataset: { testid: 'reply-quoted-by-sender' }, text: 'Quoted by sender' })
+      : null,
   );
 }
 
@@ -554,6 +763,40 @@ function buildBubble(bubble, conv, item) {
     bubble.appendChild(h('span', { class: 'message-body', dataset: { testid: 'message-body' } }));
     return;
   }
+  if (item.undecryptable) {
+    // Never a guess at the content: one fixed line.
+    bubble.classList.add('undecryptable');
+    bubble.appendChild(
+      h('span', {
+        class: 'message-undecryptable',
+        dataset: { testid: 'message-undecryptable', reason: item.undecryptable },
+        text: item.undecryptable === 'unverified' ? "Couldn't verify this message" : "Can't decrypt this message",
+      }),
+    );
+    bubble.appendChild(h('span', { class: 'message-body', dataset: { testid: 'message-body' } }));
+    return;
+  }
+  if (item.decrypting) bubble.classList.add('decrypting');
+  if (item.warning === 'unencrypted') {
+    // Plaintext where there should be none: maybe written by the server, not the sender.
+    bubble.classList.add('unencrypted-warning');
+    bubble.appendChild(
+      h('span', {
+        class: 'message-warning',
+        dataset: { testid: 'message-unencrypted-warning' },
+        text: `This message wasn't encrypted and may not be from ${userName(conv, item.senderId)}`,
+      }),
+    );
+  } else if (item.warning === 'unverified-key') {
+    bubble.classList.add('key-warning');
+    bubble.appendChild(
+      h('span', {
+        class: 'message-warning',
+        dataset: { testid: 'message-unverified-key-warning' },
+        text: 'Sent with a key you haven’t verified',
+      }),
+    );
+  }
   if (item.replyTo) bubble.appendChild(replyQuoteEl(conv, item.replyTo));
   if (item.attachment) {
     bubble.classList.add('has-media', `has-${item.attachment.kind}`);
@@ -567,7 +810,8 @@ function updateImage(bubble, item) {
   if (!img) return;
   const a = item.attachment;
   const next = a.thumbUrl || a.url;
-  img.dataset.full = a.url || next;
+  img.dataset.full = a.url || next || '';
+  img.loadFull = a.load || null;
   if (!next || img.dataset.src === next) return;
   const prev = img.dataset.src;
   img.dataset.src = next;
@@ -695,7 +939,34 @@ function updateMeta(el, item) {
     edited.remove();
   }
 
+  let legacy = meta.querySelector('.legacy-label');
+  if (item.legacy && !legacy) {
+    legacy = h('span', { class: 'legacy-label', dataset: { testid: 'legacy-unencrypted-label' }, text: 'Not encrypted' });
+    meta.appendChild(legacy);
+  } else if (!item.legacy && legacy) {
+    legacy.remove();
+  }
+
   if (!item.mine) return;
+  let waiting = meta.querySelector('.message-waiting');
+  if (item.waiting) {
+    if (!waiting) {
+      waiting = h('button', {
+        type: 'button',
+        class: 'message-waiting',
+        dataset: { testid: 'message-waiting' },
+        onclick: () => {
+          const current = itemOf.get(el);
+          const p = current && current.pending;
+          if (p && p.blocked && p.blocked.reason === 'safety') showSafetyDialog(p.blocked.userIds);
+        },
+      });
+      meta.prepend(waiting);
+    }
+    if (waiting.textContent !== item.waiting) waiting.textContent = item.waiting;
+  } else if (waiting) {
+    waiting.remove();
+  }
   const status = meta.querySelector('.message-status');
   if (status.textContent !== item.status) {
     status.textContent = item.status;
@@ -796,6 +1067,10 @@ function render({ forceBottom = false, preserveFromBottom = false } = {}) {
       desired.push(systemEl(item, conv));
       continue;
     }
+    if (item.notice) {
+      desired.push(noticeEl(item, conv));
+      continue;
+    }
     const grpStart =
       !prev ||
       prev.senderId !== item.senderId ||
@@ -879,7 +1154,7 @@ async function jumpTo(id) {
 
 function canEdit(item) {
   return (
-    item.mine && item.id !== null && !item.deleted && !item.attachment && !!item.body &&
+    item.mine && item.id !== null && !item.deleted && !item.attachment && !!item.body && !item.legacy &&
     Date.now() - item.createdAt < EDIT_WINDOW_MS
   );
 }
@@ -912,31 +1187,51 @@ function openMenuFor(el, returnTo) {
   });
 }
 
+/** Toast for a failed encrypted reaction or edit; the safety check opens the interstitial. */
+function sealedFailure(err, fallback) {
+  if (err instanceof SafetyCheckNeeded) {
+    showSafetyDialog(err.userIds);
+    return;
+  }
+  if (err instanceof MissingKeysError) {
+    toast(waitingText(getConversation(convId), err.userIds));
+    return;
+  }
+  if (err instanceof KeysNotReadyError) {
+    toast(err.message);
+    return;
+  }
+  toast(err.message || fallback);
+}
+
 async function react(item, emoji) {
   const id = convId;
   const msg = findMessage(id, item.id);
   if (!msg || !state.me) return;
-  const meId = state.me.id;
-  const removing = myReaction(msg.reactions) === emoji;
-  // Show it right away; the server's copy replaces this a moment later.
-  const reactions = {};
-  for (const [e, users] of Object.entries(msg.reactions || {})) {
-    const rest = users.filter((u) => u !== meId);
-    if (rest.length) reactions[e] = rest;
-  }
-  if (!removing) reactions[emoji] = [...(reactions[emoji] || []), meId];
-  replaceMessage(id, { ...msg, reactions });
+  const removing = myReaction(item.reactions) === emoji;
   // A copy that comes over the socket meanwhile is newer than this request's reply,
   // which then must not overwrite it (the socket brings our own change too).
   const since = liveNow();
   try {
-    const { message } = removing ? await Api.unreact(id, msg.id) : await Api.react(id, msg.id, emoji);
+    let message;
+    if (removing) {
+      ({ message } = await Api.unreact(id, msg.id));
+    } else {
+      const kind = `reaction:${msg.id}`;
+      const clientId = uuid();
+      ({ message } = await sendSealed({
+        conversationId: id,
+        kind,
+        payload: reactionPayload(msg, emoji),
+        clientId,
+        recipientIds: audienceGuess(getConversation(id), msg),
+        post: (e2ee) => Api.react(id, msg.id, { clientId, e2ee }),
+      }));
+    }
     addMessages(id, [message], { since });
     announce(removing ? 'Reaction removed' : `Reacted with ${emoji}`);
   } catch (err) {
-    const now = findMessage(id, msg.id);
-    if (now && !arrivedLiveSince(msg.id, since)) replaceMessage(id, { ...now, reactions: msg.reactions });
-    toast(err.message || 'Could not react to that message.');
+    sealedFailure(err, 'Could not react to that message.');
   }
 }
 
@@ -1008,9 +1303,10 @@ function setEditing(msg, { restoreDraft = true } = {}) {
   const input = $('message-input');
   if (msg) {
     if (!editing) draftBeforeEdit = input.value;
+    const text = messageView(msg).body || '';
     editing = { id: msg.id };
-    input.value = msg.body || '';
-    $('edit-bar-snippet').textContent = msg.body || '';
+    input.value = text;
+    $('edit-bar-snippet').textContent = text;
     $('send-button').setAttribute('aria-label', 'Save edit');
   } else {
     if (editing && restoreDraft) input.value = draftBeforeEdit;
@@ -1048,19 +1344,84 @@ async function saveEdit() {
     toast('A message can’t be empty. Use Unsend to remove it.');
     return;
   }
+  const before = messageView(msg).body;
   setEditing(null);
-  if (body === msg.body) return;
-  replaceMessage(id, { ...msg, body, editedAt: Date.now() });
+  if (body === before) return;
   const since = liveNow(); // see react()
+  const kind = `edit:${msg.id}`;
+  const clientId = uuid();
   try {
-    const { message } = await Api.editMessage(id, msg.id, body);
+    const { message } = await sendSealed({
+      conversationId: id,
+      kind,
+      payload: editPayload(msg, body),
+      clientId,
+      recipientIds: audienceGuess(getConversation(id), msg),
+      post: (e2ee) => Api.editMessage(id, msg.id, { clientId, e2ee }),
+    });
     addMessages(id, [message], { since });
     announce('Message edited');
   } catch (err) {
-    const now = findMessage(id, msg.id);
-    if (now) replaceMessage(id, { ...now, body: msg.body, editedAt: msg.editedAt });
-    toast(err.status === 409 ? 'Messages can only be edited for 15 minutes.' : err.message || 'Could not edit that message.');
+    if (err.status === 409) toast('Messages can only be edited for 15 minutes.');
+    else sealedFailure(err, 'Could not edit that message.');
   }
+}
+
+// ---------- safety numbers ----------
+
+function openSafety(userId) {
+  if (!convId || !userId) return;
+  location.hash = `#/c/${encodeURIComponent(convId)}/safety/${encodeURIComponent(userId)}`;
+}
+
+let safetyDialogUsers = [];
+
+/**
+ * A verified contact's key changed: before sending to them, ask to verify again
+ * or send anyway. The message stays queued meanwhile.
+ */
+function showSafetyDialog(userIds) {
+  const dialog = $('safety-dialog');
+  if (!convId || !userIds.length || $('chat-screen').hidden) return;
+  safetyDialogUsers = [...userIds];
+  const conv = getConversation(convId);
+  const names = userIds.map((id) => userName(conv, id));
+  const list = names.length <= 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  $('safety-dialog-title').textContent = `${list}${names.length === 1 ? '’s safety number has' : '’s safety numbers have'} changed`;
+  $('safety-dialog-text').textContent =
+    `You verified ${names.length === 1 ? names[0] : 'them'} before. A new phone or a reset key changes the number, ` +
+    'but it could also mean someone is trying to listen in. Verify again to be sure, or send anyway.';
+  if (!dialog.open) {
+    if (dialog.showModal) dialog.showModal();
+    else dialog.setAttribute('open', '');
+  }
+}
+
+function closeSafetyDialog() {
+  const dialog = $('safety-dialog');
+  if (dialog.open) {
+    if (dialog.close) dialog.close();
+    else dialog.removeAttribute('open');
+  }
+}
+
+function initSafetyDialog() {
+  $('safety-send-anyway').addEventListener('click', () => {
+    const users = safetyDialogUsers;
+    closeSafetyDialog();
+    acknowledgeChange(users); // the outbox sends what was waiting
+    announce('Sending');
+  });
+  $('safety-verify-again').addEventListener('click', () => {
+    const user = safetyDialogUsers[0];
+    closeSafetyDialog();
+    openSafety(user);
+  });
+  $('safety-dialog-cancel').addEventListener('click', closeSafetyDialog);
+  $('verify-safety-button').addEventListener('click', () => {
+    const userId = $('verify-safety-button').dataset.userId;
+    if (userId) openSafety(userId);
+  });
 }
 
 // ---------- read receipts ----------
@@ -1105,10 +1466,12 @@ function sendTyping() {
   if (socketRef.send({ type: 'typing', conversationId: convId })) lastTypingSent = now;
 }
 
-function takeReplyId() {
-  const id = replyTo ? replyTo.id : null;
-  if (replyTo) setReply(null);
-  return id;
+/** The quote for the next message ({ id, senderId, snippet }), and clear the reply bar. */
+function takeReply() {
+  if (!replyTo) return null;
+  const q = quoteOf(replyTo.id);
+  setReply(null);
+  return { id: q.id, senderId: q.senderId, snippet: q.snippet };
 }
 
 function submit() {
@@ -1119,7 +1482,7 @@ function submit() {
   const input = $('message-input');
   const body = input.value.trim();
   if (!body || !convId) return;
-  enqueue({ conversationId: convId, body, replyToId: takeReplyId() });
+  enqueue({ conversationId: convId, body, replyTo: takeReply() });
   input.value = '';
   drafts.delete(convId);
   lastTypingSent = 0;
@@ -1151,7 +1514,7 @@ async function attach(file) {
     return;
   }
   if (id !== convId) return;
-  enqueue({ conversationId: id, body: '', media, replyToId: takeReplyId() });
+  enqueue({ conversationId: id, body: '', media, replyTo: takeReply() });
   render({ forceBottom: true });
 }
 
@@ -1160,7 +1523,7 @@ function sendVoice(blob, mime, durationMs) {
   enqueue({
     conversationId: convId,
     media: { kind: 'audio', file: blob, mime, durationMs },
-    replyToId: takeReplyId(),
+    replyTo: takeReply(),
   });
   render({ forceBottom: true });
 }
@@ -1294,6 +1657,7 @@ export function initChat({ socket }) {
 
   initRecorder({ onRecorded: sendVoice });
   initMessageGestures();
+  initSafetyDialog();
 
   $('messages').addEventListener('scroll', onScroll, { passive: true });
 
@@ -1346,5 +1710,24 @@ export function initChat({ socket }) {
     if (!convId) return;
     renderHeader();
     scheduleRender();
+  });
+  // Pins, verification and key changes: notices, the header badge.
+  on('safety', () => {
+    if (!convId) return;
+    renderHeader();
+    scheduleRender();
+  });
+  on('keys-state', () => {
+    if (convId) scheduleRender();
+  });
+  on('views-reset', () => {
+    if (convId) scheduleRender();
+  });
+  // Someone new in this chat got a local notice before anything was sealed to them.
+  on('members-changed', (id) => {
+    if (id === convId) scheduleRender();
+  });
+  on('safety-needed', ({ conversationId, userIds }) => {
+    if (conversationId === convId && isChatVisible(convId)) showSafetyDialog(userIds);
   });
 }

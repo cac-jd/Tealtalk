@@ -83,8 +83,16 @@ function cleanMeta(meta) {
   return out;
 }
 
+/** `source` is a Blob, or an encryptor ({ size, read(start, end) -> Promise<bytes> }). */
+async function bytesOf(source, start, end) {
+  if (typeof Blob !== 'undefined' && source instanceof Blob) return source.slice(start, end);
+  return source.read(start, end);
+}
+
 /**
  * Upload `blob` and return the attachment.
+ *  - blob: a Blob, or an encryptor from crypto/files.js (encrypted on the fly, so
+ *    a resumed upload re-encrypts from the server's offset)
  *  - mime: the type to store
  *  - meta: { width, height, durationMs, thumbnailId }
  *  - job: a plain object kept by the caller across attempts; it remembers the
@@ -93,9 +101,10 @@ function cleanMeta(meta) {
  */
 export async function uploadBlob(blob, { mime, meta = {}, job = {}, onProgress = () => {}, signal, chunked }) {
   const useChunks = chunked ?? (blob.size > SMALL_UPLOAD_MAX || mime.startsWith('video/'));
+  if (signal && signal.aborted) throw new UploadCancelled();
   if (!useChunks) {
     const { data } = await xhrSend('POST', `/api/attachments${metaQuery(meta)}`, {
-      body: blob,
+      body: await bytesOf(blob, 0, blob.size),
       headers: { 'Content-Type': mime },
       signal,
       onProgress: (loaded) => onProgress(Math.min(0.99, loaded / blob.size)),
@@ -133,7 +142,7 @@ export async function uploadBlob(blob, { mime, meta = {}, job = {}, onProgress =
       const offset = received;
       try {
         const { data } = await xhrSend('PUT', path, {
-          body: blob.slice(offset, end),
+          body: await bytesOf(blob, offset, end),
           headers: { 'Content-Type': 'application/octet-stream', 'Upload-Offset': String(offset) },
           signal,
           onProgress: (loaded) => onProgress(Math.min(0.99, (offset + loaded) / size)),

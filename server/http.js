@@ -16,27 +16,30 @@ const {
 const auth = require('./auth');
 const { validateSubscription } = require('./push');
 const { SNIFF_BYTES, baseMime, kindOf, matchesKind, parseRange, removeFiles, partFile } = require('./media');
+const { E2EE_MIME, KEY_ID_RE, validateBundle, validateBackup, validateEnvelope, checkRecipients } = require('./e2ee');
 
 const JSON_LIMIT = 64 * 1024;
+// Messages, edits and reactions carry an envelope of up to 64 KB plus a few small fields.
+const MESSAGE_JSON_LIMIT = 80 * 1024;
 const ATTACHMENT_LIMIT = 10 * 1024 * 1024; // single-request uploads; bigger files use /api/uploads
 const CHUNK_SIZE = 5 * 1024 * 1024;
 const MAX_OPEN_UPLOADS = 5; // unfinished resumable uploads per user
-const MAX_BODY_CHARS = 4000;
 const MAX_GROUP_MEMBERS = 256;
+const MAX_RECIPIENTS = MAX_GROUP_MEMBERS + 1; // the creator plus everyone they added
 const MAX_TITLE_CHARS = 80;
-const MAX_EMOJI_BYTES = 16;
+const MAX_MESSAGE_ATTACHMENTS = 20;
+const MAX_KEY_LOOKUP = 100;
 const MAX_DIMENSION = 100000;
 const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const UNSEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const USERNAME_RE = /^[a-z0-9_]+$/;
-const EMOJI_RE = /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u;
-const graphemes = new Intl.Segmenter('en', { granularity: 'grapheme' });
 
 const TYPE_ERROR =
   'Only photos (JPEG, PNG, GIF, WebP), videos (MP4, MOV, WebM) and voice messages (M4A, AAC, MP3, WebM, Ogg) can be sent';
 const MISMATCH_ERROR = "That file isn't the type it says it is";
+const RELOAD_ERROR = 'Please reload TealTalk to get the encrypted version.';
 
 // ---- validation helpers ---------------------------------------------------
 
@@ -82,26 +85,28 @@ function validateTitle(value) {
   return t || null;
 }
 
-/** Message text: trimmed, at most MAX_BODY_CHARS. Returns '' for a missing body. */
-function validateBody(value) {
-  if (value === undefined || value === null) return '';
-  if (typeof value !== 'string') throw new HttpError(400, 'body must be a string');
-  const text = value.trim();
-  if (text.length > MAX_BODY_CHARS) throw new HttpError(400, `Messages can be at most ${MAX_BODY_CHARS} characters`);
-  return text;
+/**
+ * clientIds go into the envelope's AAD, which joins fields with '|': only 1-64 letters, digits,
+ * '-' and '_' are allowed, so a clientId can never smuggle in a separator.
+ */
+const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+function validateClientId(clientId) {
+  if (typeof clientId !== 'string' || !CLIENT_ID_RE.test(clientId)) {
+    throw new HttpError(400, 'clientId must be 1-64 letters, digits, - or _');
+  }
+  return clientId;
 }
 
-/** Exactly one emoji (one grapheme with a pictographic code point), at most 16 bytes of UTF-8. */
-function validateEmoji(value) {
-  if (typeof value !== 'string' || !value) throw new HttpError(400, 'emoji is required');
-  if (Buffer.byteLength(value, 'utf8') > MAX_EMOJI_BYTES) throw new HttpError(400, 'That reaction is too long');
-  if (hasControlChars(value) || /\s/u.test(value) || !EMOJI_RE.test(value)) {
-    throw new HttpError(400, 'Reactions must be one emoji');
+/**
+ * Since v3 messages, edits and reactions are encrypted only. A request with plaintext fields (or
+ * without an envelope) comes from an old copy of the app, which gets told to reload.
+ */
+function rejectPlaintext(body, plaintextFields) {
+  for (const field of plaintextFields) {
+    const v = body[field];
+    if (v !== undefined && v !== null && v !== '') throw new HttpError(400, RELOAD_ERROR);
   }
-  const iter = graphemes.segment(value)[Symbol.iterator]();
-  iter.next();
-  if (!iter.next().done) throw new HttpError(400, 'Reactions must be one emoji');
-  return value;
+  if (body.e2ee === undefined || body.e2ee === null) throw new HttpError(400, RELOAD_ERROR);
 }
 
 /** Optional whole number from JSON (number) or a query string (digits); null when absent. */
@@ -189,6 +194,11 @@ function mb(bytes) {
   return Number.isInteger(v) ? `${v} MB` : `${v.toFixed(1)} MB`;
 }
 
+/** Magic-byte check for plaintext media. Encrypted files are opaque bytes and skip it. */
+function contentMatches(head, kind) {
+  return kind === 'e2ee' || matchesKind(head, kind);
+}
+
 // ---- handler factory --------------------------------------------------------
 
 function createHttpHandler({
@@ -199,12 +209,19 @@ function createHttpHandler({
   staticHandler,
   uploadsDir,
   rateLimiter,
+  keysRateLimiter,
   trustProxy,
   maxUploadBytes = 250 * 1024 * 1024,
   now = Date.now,
   log = console,
 }) {
   const smallUploadLimit = Math.min(ATTACHMENT_LIMIT, maxUploadBytes);
+  // MAX_UPLOAD_MB is about the real file: an encrypted copy may be bigger by its GCM tags
+  // (16 bytes per 256 KiB record, docs/E2EE.md "Files").
+  const withTags = (n) => n + 16 * Math.max(1, Math.ceil(n / (256 * 1024)));
+  const maxE2eeUploadBytes = withTags(maxUploadBytes);
+  const smallE2eeUploadLimit = Math.min(withTags(ATTACHMENT_LIMIT), withTags(maxUploadBytes));
+  const sizeLimit = (mime) => (mime === E2EE_MIME ? maxE2eeUploadBytes : maxUploadBytes);
   const busyUploads = new Set(); // resumable uploads with a chunk or completion in flight
 
   function clientIp(req) {
@@ -524,33 +541,46 @@ function createHttpHandler({
     sendJson(res, 200, { messages: store.listMessages(conv.id, before, limit, visibleFrom) });
   }
 
+  const keysFor = (userIds) => store.currentKeys(userIds);
+
+  /**
+   * `attachmentIds` of a new encrypted message: at most 20 distinct files, each the sender's own
+   * unexpired upload of type application/vnd.tealtalk.e2ee that no message carries yet.
+   */
+  function validateAttachmentIds(list, userId) {
+    if (list === undefined || list === null) return [];
+    if (!Array.isArray(list) || list.length > MAX_MESSAGE_ATTACHMENTS) {
+      throw new HttpError(400, `attachmentIds must be a list of at most ${MAX_MESSAGE_ATTACHMENTS} files`);
+    }
+    const ids = [];
+    for (const attId of list) {
+      if (typeof attId !== 'string' || !ID_RE.test(attId)) throw new HttpError(400, 'attachmentIds is invalid');
+      if (ids.includes(attId)) throw new HttpError(400, 'The same file is attached twice');
+      const att = store.getAttachment(attId);
+      if (!att || att.uploader_id !== userId) throw new HttpError(400, 'Attachment not found');
+      if (att.mime !== E2EE_MIME) throw new HttpError(400, 'Only encrypted files can be attached');
+      if (att.expired) throw new HttpError(400, 'That file has expired');
+      if (store.attachmentInUse(att.id)) throw new HttpError(400, 'That file was already sent');
+      ids.push(att.id);
+    }
+    return ids;
+  }
+
+  /** `{ clientId, e2ee, attachmentIds?, replyToId? }`: an encrypted message (docs/E2EE.md). */
   async function postMessage(req, res, id) {
     const { user } = authenticate(req);
     const { conv, visibleFrom } = memberAccess(id, user.id);
-    const body = await readJson(req, JSON_LIMIT);
-    const { clientId } = body;
-    if (typeof clientId !== 'string' || clientId.length < 1 || clientId.length > 100 || hasControlChars(clientId)) {
-      throw new HttpError(400, 'clientId must be a string of 1-100 characters');
-    }
+    const body = await readJson(req, MESSAGE_JSON_LIMIT);
+    rejectPlaintext(body, ['body', 'attachmentId']);
+    const clientId = validateClientId(body.clientId);
     const existing = store.getMessageByClientId(user.id, clientId);
     if (existing) {
       if (existing.conversationId !== conv.id) throw new HttpError(409, 'clientId was already used in another conversation');
       sendJson(res, 200, { message: existing });
       return;
     }
-    const text = validateBody(body.body);
-    let attachmentId = null;
-    if (body.attachmentId !== undefined && body.attachmentId !== null) {
-      if (typeof body.attachmentId !== 'string' || !ID_RE.test(body.attachmentId)) {
-        throw new HttpError(400, 'attachmentId is invalid');
-      }
-      const att = store.getAttachment(body.attachmentId);
-      if (!att || att.uploader_id !== user.id) throw new HttpError(400, 'Attachment not found');
-      if (att.expired) throw new HttpError(400, 'That file has expired');
-      if (store.attachmentInUse(att.id)) throw new HttpError(400, 'That file was already sent');
-      attachmentId = att.id;
-    }
-    if (!text && !attachmentId) throw new HttpError(400, 'Message is empty');
+    const e2ee = validateEnvelope(body.e2ee, 'message', clientId, MAX_RECIPIENTS);
+    const attachmentIds = validateAttachmentIds(body.attachmentIds, user.id);
     let replyToId = null;
     if (body.replyToId !== undefined && body.replyToId !== null) {
       const rid = positiveInt(body.replyToId, 'replyToId');
@@ -561,30 +591,22 @@ function createHttpHandler({
       if (target.deleted_at !== null || target.system_type) throw new HttpError(400, "You can't reply to that message");
       replyToId = target.id;
     }
-
-    let message;
-    try {
-      message = store.insertMessage({
-        conversationId: conv.id,
-        senderId: user.id,
-        clientId,
-        body: text,
-        attachmentId,
-        replyToId,
-        createdAt: now(),
-      });
-    } catch (err) {
-      // Concurrent retry with the same clientId.
-      const dup = store.getMessageByClientId(user.id, clientId);
-      if (dup && dup.conversationId === conv.id) {
-        sendJson(res, 200, { message: dup });
-        return;
-      }
-      throw err;
-    }
-    sendJson(res, 201, { message });
-
+    // A new message is seen by every current member (its id is past everyone's visible_from).
     const memberIds = store.memberIds(conv.id);
+    checkRecipients(e2ee, user.id, memberIds, keysFor);
+
+    // No await between the checks above and this insert, so nothing can change in between.
+    const message = store.insertMessage({
+      conversationId: conv.id,
+      senderId: user.id,
+      clientId,
+      body: '',
+      e2ee,
+      attachmentIds,
+      replyToId,
+      createdAt: now(),
+    });
+    sendJson(res, 201, { message });
     hub.sendToUsers(memberIds, { type: 'message', message });
     push.notifyMessage(message, conv, user, memberIds);
   }
@@ -597,12 +619,16 @@ function createHttpHandler({
     return { user, conv, row };
   }
 
+  /** `{ clientId, e2ee }` with kind `reaction:<msgId>`, addressed to everyone who can see the message. */
   async function putReaction(req, res, id, msgId) {
     const { user, row } = actionTarget(req, id, msgId);
-    const body = await readJson(req, JSON_LIMIT);
-    const emoji = validateEmoji(body.emoji);
+    const body = await readJson(req, MESSAGE_JSON_LIMIT);
+    rejectPlaintext(body, ['emoji']);
     if (row.deleted_at !== null || row.system_type) throw new HttpError(400, "You can't react to that message");
-    const changed = store.setReaction(row.id, user.id, emoji, now());
+    const clientId = validateClientId(body.clientId);
+    const e2ee = validateEnvelope(body.e2ee, `reaction:${row.id}`, clientId, MAX_RECIPIENTS);
+    checkRecipients(e2ee, user.id, store.memberIdsSeeing(row.conversation_id, row.id), keysFor);
+    const changed = store.setReaction(row.id, user.id, e2ee, clientId, now());
     const message = store.getMessage(row.id);
     sendJson(res, 200, { message });
     if (changed) broadcastMessage(message);
@@ -617,23 +643,31 @@ function createHttpHandler({
     if (changed) broadcastMessage(message);
   }
 
+  /**
+   * `{ clientId, e2ee }` with kind `edit:<msgId>`: replaces the envelope and sets editedAt. Sender
+   * only, encrypted text messages only (the edit payload carries just the new text, so a message
+   * with files would lose their keys), within 15 minutes.
+   */
   async function editMessage(req, res, id, msgId) {
     const { user, row } = actionTarget(req, id, msgId);
-    const body = await readJson(req, JSON_LIMIT);
+    const body = await readJson(req, MESSAGE_JSON_LIMIT);
     if (row.sender_id !== user.id) throw new HttpError(403, 'You can only edit your own messages');
+    rejectPlaintext(body, ['body']);
     if (row.deleted_at !== null || row.system_type) throw new HttpError(400, "That message can't be edited");
-    if (row.attachment_id) throw new HttpError(400, 'Only text messages can be edited');
-    const text = validateBody(body.body);
-    if (!text) throw new HttpError(400, 'Message is empty');
+    if (row.e2ee === null) throw new HttpError(400, "Messages sent before encryption can't be edited");
+    if (row.attachment_id || store.messageAttachmentIds(row.id).length) throw new HttpError(400, 'Only text messages can be edited');
+    const clientId = validateClientId(body.clientId);
+    const e2ee = validateEnvelope(body.e2ee, `edit:${row.id}`, clientId, MAX_RECIPIENTS);
     if (now() - row.created_at > EDIT_WINDOW_MS) throw new HttpError(409, 'Messages can only be edited for 15 minutes');
-    if (text === row.body) {
+    checkRecipients(e2ee, user.id, store.memberIdsSeeing(row.conversation_id, row.id), keysFor);
+    if (JSON.stringify(e2ee) === row.e2ee && clientId === row.e2ee_client_id) {
       sendJson(res, 200, { message: store.getMessage(row.id) });
       return;
     }
-    const message = store.editMessage(row.id, text, now());
+    const message = store.editMessage(row.id, e2ee, clientId, now());
     sendJson(res, 200, { message });
     broadcastMessage(message);
-    broadcastRepliesTo(row.id);
+    // Replies quoting an encrypted message show only { id, senderId, deleted }: nothing to re-send.
   }
 
   async function unsendMessage(req, res, id, msgId) {
@@ -667,14 +701,99 @@ function createHttpHandler({
     }
   }
 
+  // ---- key directory -------------------------------------------------------------------
+
+  /**
+   * Whose public keys a user may look up: their own, anyone they share a conversation with, and
+   * anyone they can find through user search. Search matches every account by username prefix
+   * (that is how new chats start), so in practice this is any existing user; unknown ids look
+   * exactly like users without keys.
+   */
+  function canSeeKeys(viewerId, targetId) {
+    return viewerId === targetId || !!store.getUser(targetId);
+  }
+
+  /**
+   * `{ bundle, backup }`: publish a new current key (old bundles stay readable).
+   * - Re-sending the current keyId is a no-op 200.
+   * - A keyId from the user's history that isn't current, or a createdAt that isn't newer than the
+   *   current key's, is `409 { error: "key_rollback" }`: an old (maybe stolen) key never comes back.
+   * - At most 5 key changes per user per 24 hours (429).
+   */
+  async function putKeys(req, res) {
+    const { user } = authenticate(req);
+    const body = await readJson(req, JSON_LIMIT);
+    const own = store.getOwnKeys(user.id);
+    const bundle = validateBundle(body.bundle, user.id, now(), { allowOld: !own });
+    const backup = validateBackup(body.backup, bundle.keyId);
+    if (own && own.bundle && own.bundle.keyId === bundle.keyId) {
+      sendJson(res, 200, { bundle: own.bundle });
+      return;
+    }
+    if (store.getBundle(user.id, bundle.keyId) || (own && own.bundle && bundle.createdAt <= own.bundle.createdAt)) {
+      throw new HttpError(409, 'key_rollback');
+    }
+    const r = keysRateLimiter.hit(user.id, now());
+    if (!r.ok) {
+      throw new HttpError(429, 'Too many key changes today, try again later', { 'Retry-After': String(r.retryAfter) });
+    }
+    const result = store.putKeys(user.id, bundle, backup, now());
+    if (result.rollback) throw new HttpError(409, 'key_rollback');
+    sendJson(res, 200, { bundle: result.bundle });
+    if (result.changed) {
+      hub.sendToUsers([user.id, ...store.contactIds(user.id)], { type: 'keys', userId: user.id, bundle: result.bundle });
+    }
+  }
+
+  async function getMyKeys(req, res) {
+    const { user } = authenticate(req);
+    const own = store.getOwnKeys(user.id);
+    sendJson(res, 200, { bundle: own ? own.bundle : null, backup: own ? own.backup : null });
+  }
+
+  /** `?userIds=u1,u2` (at most 100): `{ keys: { u1: Bundle | null } }`, current bundles. */
+  async function getKeys(req, res, query) {
+    const { user } = authenticate(req);
+    const raw = query.get('userIds');
+    if (raw === null) throw new HttpError(400, 'userIds is required');
+    const ids = [];
+    for (const part of raw.split(',')) {
+      const uid = part.trim();
+      if (!uid) continue;
+      if (!ID_RE.test(uid)) throw new HttpError(400, 'userIds must be a comma-separated list of user ids');
+      if (!ids.includes(uid)) ids.push(uid);
+      if (ids.length > MAX_KEY_LOOKUP) throw new HttpError(400, `At most ${MAX_KEY_LOOKUP} users at a time`);
+    }
+    const visible = ids.filter((uid) => canSeeKeys(user.id, uid));
+    const current = store.currentKeys(visible);
+    const keys = Object.create(null);
+    for (const uid of ids) keys[uid] = current.has(uid) ? current.get(uid).bundle : null;
+    sendJson(res, 200, { keys });
+  }
+
+  /** `/api/keys/:userId?keyId=`: a bundle that user published (current or older); current without keyId. */
+  async function getUserKey(req, res, userId, query) {
+    const { user } = authenticate(req);
+    const keyId = query.get('keyId');
+    if (keyId !== null && keyId !== '' && !KEY_ID_RE.test(keyId)) throw new HttpError(400, 'keyId is invalid');
+    let bundle = null;
+    if (ID_RE.test(userId) && canSeeKeys(user.id, userId)) {
+      if (keyId) bundle = store.getBundle(userId, keyId);
+      else bundle = store.currentKeys([userId]).get(userId)?.bundle ?? null;
+    }
+    if (!bundle) throw new HttpError(404, 'Key not found');
+    sendJson(res, 200, { bundle });
+  }
+
   // ---- media ------------------------------------------------------------------------
 
   /**
    * Validates optional media metadata (from a query string or JSON). Dimensions only apply to
    * photos and videos, durations to videos and voice messages. A thumbnail must be one of my own
-   * photos.
+   * photos. Encrypted files keep no metadata at all: it lives in the encrypted payload.
    */
   function mediaMeta(src, kind, userId) {
+    if (kind === 'e2ee') return { width: null, height: null, durationMs: null, thumbnailId: null };
     const width = optionalInt(src.width, 'width', 1, MAX_DIMENSION);
     const height = optionalInt(src.height, 'height', 1, MAX_DIMENSION);
     const durationMs = optionalInt(src.durationMs, 'durationMs', 0, MAX_DURATION_MS);
@@ -702,16 +821,17 @@ function createHttpHandler({
     const mime = baseMime(req.headers['content-type']);
     const kind = kindOf(mime);
     if (!kind) throw new HttpError(415, TYPE_ERROR);
+    const limit = mime === E2EE_MIME ? smallE2eeUploadLimit : smallUploadLimit;
     const tooBig = () => new HttpError(413, `Files over ${mb(smallUploadLimit)} need a resumable upload`);
     const declared = Number(req.headers['content-length']);
-    if (Number.isFinite(declared) && declared > smallUploadLimit) throw tooBig();
+    if (Number.isFinite(declared) && declared > limit) throw tooBig();
     const meta = mediaMeta(Object.fromEntries(query), kind, user.id);
 
     const id = newId('a');
     const tmp = path.join(uploadsDir, `.tmp-${crypto.randomBytes(8).toString('hex')}`);
     let received;
     try {
-      received = await receiveToFile(req, tmp, { flags: 'wx', limit: smallUploadLimit, tooBig });
+      received = await receiveToFile(req, tmp, { flags: 'wx', limit, tooBig });
     } catch (err) {
       fs.rmSync(tmp, { force: true });
       throw err;
@@ -720,7 +840,7 @@ function createHttpHandler({
       fs.rmSync(tmp, { force: true });
       throw new HttpError(400, 'Empty upload');
     }
-    if (!matchesKind(received.head, kind)) {
+    if (!contentMatches(received.head, kind)) {
       fs.rmSync(tmp, { force: true });
       throw new HttpError(415, MISMATCH_ERROR);
     }
@@ -751,7 +871,7 @@ function createHttpHandler({
     if (!kind) throw new HttpError(415, TYPE_ERROR);
     const { size } = body;
     if (!Number.isSafeInteger(size) || size < 1) throw new HttpError(400, 'size must be a positive number of bytes');
-    if (size > maxUploadBytes) throw new HttpError(413, `Files can be at most ${mb(maxUploadBytes)}`);
+    if (size > sizeLimit(mime)) throw new HttpError(413, `Files can be at most ${mb(maxUploadBytes)}`);
     // At most MAX_OPEN_UPLOADS unfinished uploads per person. A new one replaces the oldest idle
     // one, so abandoned uploads never lock anyone out for a day.
     const open = store.uploadIdsForUser(user.id);
@@ -825,7 +945,7 @@ function createHttpHandler({
       discardUpload(upload.id);
       throw new HttpError(404, 'Upload not found');
     }
-    if (!matchesKind(head, upload.kind)) {
+    if (!contentMatches(head, upload.kind)) {
       discardUpload(upload.id);
       throw new HttpError(415, MISMATCH_ERROR);
     }
@@ -968,6 +1088,10 @@ function createHttpHandler({
         return pick({ POST: uploadAttachment })(req, res, query);
       case '/api/uploads':
         return pick({ POST: startUpload })(req, res);
+      case '/api/keys':
+        return pick({ GET: getKeys, PUT: putKeys })(req, res, query);
+      case '/api/keys/me':
+        return pick({ GET: getMyKeys })(req, res);
       case '/api/push/public-key':
         return pick({ GET: () => sendJson(res, 200, { publicKey: push.publicKey }) })();
       case '/api/push/subscribe':
@@ -997,6 +1121,8 @@ function createHttpHandler({
       if (match[2]) return pick({ POST: completeUpload })(req, res, match[1]);
       return pick({ GET: getUploadStatus, PUT: putChunk, DELETE: cancelUpload })(req, res, match[1]);
     }
+    match = /^\/api\/keys\/([^/]+)$/.exec(pathname);
+    if (match) return pick({ GET: getUserKey })(req, res, match[1], query);
     match = /^\/api\/attachments\/([^/]+)$/.exec(pathname);
     if (match) return pick({ GET: getAttachment })(req, res, match[1], query);
     throw new HttpError(404, 'Not found');
@@ -1047,6 +1173,8 @@ module.exports = {
   createHttpHandler,
   ATTACHMENT_LIMIT,
   JSON_LIMIT,
+  MESSAGE_JSON_LIMIT,
+  RELOAD_ERROR,
   CHUNK_SIZE,
   MAX_OPEN_UPLOADS,
   EDIT_WINDOW_MS,

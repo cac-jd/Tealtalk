@@ -1,4 +1,4 @@
-// Settings: profile, notifications, install, logout.
+// Settings: profile, notifications, install, encryption, about, logout.
 
 import { Api } from '../api.js';
 import { avatar, clear, isIOS } from '../dom.js';
@@ -9,7 +9,10 @@ import {
   installState,
   promptInstall,
   pushSupported,
+  appFingerprint,
 } from '../pwa.js';
+import { resetKeys, keysReady, getKeyState } from '../e2ee.js';
+import { START_FRESH_WARNING } from './keys.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -71,8 +74,25 @@ function renderInstall() {
       'To install, use your browser menu and choose "Install app" or "Add to Home screen".';
 }
 
+let fingerprintSeq = 0;
+
+/** The app fingerprint, computed by the service worker from its cached files. */
+function renderFingerprint() {
+  const el = $('app-fingerprint');
+  const seq = ++fingerprintSeq;
+  el.textContent = 'Calculating…';
+  appFingerprint().then((fp) => {
+    if (seq !== fingerprintSeq) return;
+    el.textContent = fp || 'Not available yet. Reopen Settings in a moment.';
+  });
+}
+
 export function openSettings() {
   renderProfile();
+  renderFingerprint();
+  setStatus('keys-status', '');
+  // A key whose recovery key was never confirmed (the app closed first): suggest a reset.
+  $('recovery-unconfirmed-note').hidden = !getKeyState().recoveryUnconfirmed;
   $('displayname-input').value = state.me ? state.me.displayName : '';
   setStatus('settings-status', '');
   setStatus('notif-status', '');
@@ -136,6 +156,22 @@ export function initSettings({ onLogout }) {
   });
 
   $('logout-button').addEventListener('click', () => onLogout());
+
+  $('reset-keys-button').addEventListener('click', async () => {
+    if (!keysReady()) return;
+    if (!window.confirm(START_FRESH_WARNING.replace('Start fresh with a new key?', 'Reset your key?'))) return;
+    const button = $('reset-keys-button');
+    button.disabled = true;
+    setStatus('keys-status', 'Making a new key…');
+    try {
+      await resetKeys(); // then the new recovery key is shown
+      setStatus('keys-status', '');
+    } catch {
+      setStatus('keys-status', 'Couldn’t reset your key. Check your connection and try again.', true);
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   on('me', () => {
     if (!$('settings-screen').hidden) renderProfile();

@@ -50,18 +50,28 @@ function validateSubscription(sub) {
   return { endpoint, keys: { p256dh, auth } };
 }
 
-const KIND_PREVIEW = { image: 'Photo', video: 'Video', audio: 'Voice message' };
+/** Pushes larger than this go without the envelope (web push payloads are limited to ~4 KB). */
+const MAX_PUSH_PAYLOAD_BYTES = 3000;
 
-/** Notification text: the message, else what was attached (`attachment` is an Attachment or `true` for a photo). */
-function preview(body, attachment) {
-  const text = (body || '').replace(/\s+/g, ' ').trim();
-  if (!text) {
-    if (!attachment) return '';
-    return KIND_PREVIEW[attachment.kind] || 'Photo';
+/**
+ * The push payload for a new message (docs/E2EE.md, "Push"): `{ conversationId, messageId,
+ * senderId, clientId, title, e2ee }`. The service worker needs senderId and clientId to rebuild the
+ * envelope's AAD. `e2ee` is left out when the whole payload would exceed 3000 bytes; the service
+ * worker then shows "New message".
+ */
+function pushPayload(message, title) {
+  const base = {
+    conversationId: message.conversationId,
+    messageId: message.id,
+    senderId: message.senderId,
+    clientId: message.clientId,
+    title,
+  };
+  if (message.e2ee) {
+    const full = JSON.stringify({ ...base, e2ee: message.e2ee });
+    if (Buffer.byteLength(full) <= MAX_PUSH_PAYLOAD_BYTES) return full;
   }
-  const chars = Array.from(text);
-  if (chars.length <= 100) return text;
-  return chars.slice(0, 99).join('') + '…';
+  return JSON.stringify(base);
 }
 
 class PushService {
@@ -110,11 +120,7 @@ class PushService {
         const recipients = memberIds.filter((id) => id !== sender.id && !this.hub.isOnline(id));
         if (!recipients.length) return;
         const title = conversationRow.is_group && conversationRow.title ? conversationRow.title : sender.displayName;
-        const payload = JSON.stringify({
-          title,
-          body: preview(message.body, message.attachment),
-          conversationId: message.conversationId,
-        });
+        const payload = pushPayload(message, title);
         for (const userId of recipients) {
           for (const sub of this.store.pushSubscriptionsFor(userId)) this.deliver(sub, payload);
         }
@@ -156,4 +162,4 @@ class PushService {
   }
 }
 
-module.exports = { PushService, loadVapidKeys, validateSubscription, preview };
+module.exports = { PushService, loadVapidKeys, validateSubscription, pushPayload, MAX_PUSH_PAYLOAD_BYTES };

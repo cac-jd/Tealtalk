@@ -743,8 +743,16 @@ svg {
 }
 
 .chat-title {
-  display: block;
+  display: flex;
+  align-items: center;
   font-size: 1.05rem;
+}
+
+/* The name gets the ellipsis, so a long one never pushes the verified badge out of view. */
+.chat-title > #chat-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-subtitle {
@@ -1995,4 +2003,272 @@ div.note ol {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---------- encryption (v3) ---------- */
+
+.keys-screen .auth-card {
+  display: grid;
+  gap: 12px;
+}
+
+/* The setup screen usually only flashes for a moment at launch: fade it in late. */
+#key-setup-screen .auth-card {
+  animation: keys-fade-in 0.2s ease 0.5s both;
+}
+
+@keyframes keys-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.keys-text {
+  margin: 0;
+  color: var(--text-muted);
+  text-align: left;
+}
+
+.keys-alt {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.recovery-key {
+  margin: 8px 0;
+  padding: 16px 12px;
+  border: 2px dashed var(--teal);
+  border-radius: 14px;
+  background: var(--surface);
+  font: 600 1.25rem/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.recovery-input {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.recovery-input::placeholder {
+  text-transform: none;
+}
+
+.btn.danger-text {
+  color: var(--danger);
+}
+
+.fingerprint-label {
+  margin-bottom: 2px !important;
+  font-weight: 600;
+}
+
+.fingerprint code {
+  display: block;
+  font: 0.8rem/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+/* Safety numbers */
+
+.safety-number {
+  max-width: 24ch;
+  margin: 12px auto !important;
+  font: 600 1.3rem/1.7 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  word-spacing: 0.35em;
+  text-align: center;
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.safety-number.pending {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 1rem;
+}
+
+.safety-verified,
+.verified-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--teal);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .safety-verified,
+  .verified-badge {
+    color: var(--brand);
+  }
+}
+
+.chat-title .verified-badge {
+  flex: none;
+  margin-left: 6px;
+  vertical-align: -2px;
+  color: inherit;
+}
+
+.chat-title .verified-badge svg {
+  width: 16px;
+  height: 16px;
+}
+
+.member .verified-badge {
+  margin-left: auto;
+}
+
+.member-safety {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.safety-notice {
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+
+/* Message states */
+
+.message-undecryptable {
+  display: block;
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.bubble.decrypting {
+  min-width: 48px;
+  min-height: 1.4em;
+}
+
+.bubble.decrypting:not(.has-media)::after {
+  content: "…";
+  opacity: 0.5;
+}
+
+.legacy-label {
+  font-style: italic;
+}
+
+.message-waiting {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  text-align: right;
+}
+
+/* Encrypted media: placeholder boxes while downloading and decrypting */
+
+.message-image.loading,
+.message-image:not([src]) {
+  min-width: 160px;
+  min-height: 120px;
+  background: var(--bubble-other);
+}
+
+.media-status {
+  position: absolute;
+  inset: auto 8px 8px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #fff;
+  font-size: 0.8rem;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 60%);
+}
+
+.media-progress {
+  width: 100%;
+  height: 6px;
+}
+
+.video-load {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 55%);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.video-load svg {
+  width: 20px;
+  height: 20px;
+}
+
+.media-retry {
+  color: inherit;
+}
+
+.message-audio.loading .audio-toggle {
+  opacity: 0.6;
+}
+
+.meta:has(.message-waiting) {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.meta .message-waiting {
+  order: 9;
+  flex-basis: 100%;
+}
+
+/* Trust warnings (docs/E2EE.md): plaintext where there should be none, an unconfirmed key */
+.message-warning {
+  display: block;
+  margin-bottom: 4px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.reply-quote-source {
+  display: block;
+  font-size: 0.72rem;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.member-notice {
+  font-size: 0.8rem;
+}
+
+.key-conflict {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.key-conflict .keys-text {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+#recovery-confirm-form {
+  margin-top: 8px;
 }

@@ -8,6 +8,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const WebSocket = require('ws');
 const { createApp } = require('../server');
+const { makeKeys, envelope } = require('./e2ee-helpers');
 
 const quietLog = { log() {}, info() {}, warn() {}, error() {} };
 
@@ -25,6 +26,7 @@ async function startApp(opts = {}) {
     dataDir,
   });
   app.dataDir = dataDir;
+  app.clock = typeof opts.now === 'function' ? opts.now : Date.now; // the server's clock, for bundle createdAt
   const close = app.close;
   app.close = async (keepData = false) => {
     await close();
@@ -56,12 +58,24 @@ function uniqueName(prefix = 'user') {
   return `${prefix}_${process.pid % 1000}_${counter}`.slice(0, 24);
 }
 
-async function register(app, username = uniqueName(), extra = {}) {
+/** Publishes a (new, genuinely valid) key bundle for `who`; sets who.keys. */
+async function putKeys(app, who, keys) {
+  const k = keys || (await makeKeys(who.user.id, { createdAt: app.clock() }));
+  const res = await request(app, 'PUT', '/api/keys', { token: who.token, body: { bundle: k.bundle, backup: k.backup } });
+  if (res.status !== 200) throw new Error(`PUT /api/keys failed ${res.status} ${res.text}`);
+  who.keys = k;
+  return k;
+}
+
+/** Registers a user and (unless `{ keys: false }`) publishes a key bundle for them. */
+async function register(app, username = uniqueName(), extra = {}, { keys = true } = {}) {
   const res = await request(app, 'POST', '/api/register', {
     body: { username, password: 'correct horse battery', ...extra },
   });
   if (res.status !== 201) throw new Error(`register failed ${res.status} ${res.text}`);
-  return { token: res.body.token, user: res.body.user };
+  const who = { token: res.body.token, user: res.body.user, keys: null };
+  if (keys) await putKeys(app, who);
+  return who;
 }
 
 async function dm(app, a, b) {
@@ -69,13 +83,119 @@ async function dm(app, a, b) {
   return res.body.conversation;
 }
 
-async function send(app, who, conversationId, body, extra = {}) {
-  const res = await request(app, 'POST', `/api/conversations/${conversationId}/messages`, {
-    token: who.token,
-    body: { clientId: crypto.randomUUID(), body, ...extra },
-  });
+/**
+ * Test-only stand-in for encryption: the "ciphertext" is the payload JSON followed by 16 zero
+ * bytes (where a GCM tag would be), so tests can check which envelope came back. The server
+ * treats ct as opaque bytes either way.
+ */
+function fakeCt(payload) {
+  return Buffer.concat([Buffer.from(JSON.stringify(payload), 'utf8'), Buffer.alloc(16)]).toString('base64url');
+}
+
+/** The test payload inside a message's (or an envelope's) fake ciphertext, or null. */
+function payloadOf(x) {
+  const env = x && x.e2ee !== undefined ? x.e2ee : x;
+  if (!env || !env.ct) return null;
+  const buf = Buffer.from(env.ct, 'base64url');
+  try {
+    return JSON.parse(buf.subarray(0, buf.length - 16).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** The text of a message sent by these helpers ('' for files-only), from its fake ciphertext. */
+function textOf(x) {
+  const p = payloadOf(x);
+  return p ? p.body ?? p.emoji ?? null : null;
+}
+
+/** Current keyIds for `userIds`: { userId: keyId | null }. */
+async function currentKeyIds(app, who, userIds) {
+  const res = await request(app, 'GET', `/api/keys?userIds=${userIds.join(',')}`, { token: who.token });
+  if (res.status !== 200) throw new Error(`GET /api/keys failed ${res.status} ${res.text}`);
+  return Object.fromEntries(Object.entries(res.body.keys).map(([id, b]) => [id, b ? b.keyId : null]));
+}
+
+/**
+ * An envelope from `who` addressed to `audience` (default: every current member) with their
+ * current keys. `payload` goes into the fake ciphertext.
+ */
+async function makeEnvelope(app, who, conversationId, { kind = 'message', payload = {}, audience } = {}) {
+  let ids = audience;
+  if (!ids) {
+    const res = await request(app, 'GET', `/api/conversations/${conversationId}`, { token: who.token });
+    // Not a member (or no such chat): address just myself; the server rejects it anyway.
+    ids = res.status === 200 ? res.body.conversation.members.map((m) => m.id) : [who.user.id];
+  }
+  const keyIds = await currentKeyIds(app, who, [...new Set([...ids, who.user.id])]);
+  const recipients = Object.fromEntries(ids.map((id) => [id, keyIds[id]]));
+  const env = envelope({ kind, senderKeyId: keyIds[who.user.id], recipients });
+  env.ct = fakeCt({ kind, ...payload });
+  return env;
+}
+
+/**
+ * Sends an encrypted message (text goes into the fake ciphertext). `extra` may carry replyToId,
+ * attachmentIds or clientId. Returns the message; throws unless the server answers 201.
+ */
+async function send(app, who, conversationId, text, extra = {}) {
+  const res = await postEncrypted(app, who, conversationId, text, extra);
   if (res.status !== 201) throw new Error(`send failed ${res.status} ${res.text}`);
   return res.body.message;
+}
+
+/** Like send() but returns the raw response. */
+async function postEncrypted(app, who, conversationId, text, extra = {}) {
+  const { audience, ...rest } = extra;
+  const e2ee = await makeEnvelope(app, who, conversationId, { kind: 'message', payload: { body: text }, audience });
+  return request(app, 'POST', `/api/conversations/${conversationId}/messages`, {
+    token: who.token,
+    body: { clientId: crypto.randomUUID(), e2ee, ...rest },
+  });
+}
+
+/**
+ * Reacts (kind reaction:<id>) or edits (kind edit:<id>) with an envelope. Addressed to every
+ * member first; if the server says some of them can't see the message (members_changed), it
+ * retries with the members it names, like the app does.
+ */
+async function act(app, who, conversationId, messageId, action, payload) {
+  const kind = `${action}:${messageId}`;
+  const method = action === 'reaction' ? 'PUT' : 'PATCH';
+  const url = `/api/conversations/${conversationId}/messages/${messageId}${action === 'reaction' ? '/reaction' : ''}`;
+  let audience;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const e2ee = await makeEnvelope(app, who, conversationId, { kind, payload, audience });
+    const res = await request(app, method, url, { token: who.token, body: { clientId: crypto.randomUUID(), e2ee } });
+    if (res.status === 409 && res.body && res.body.error === 'members_changed' && !audience) {
+      audience = res.body.members;
+      continue;
+    }
+    return res;
+  }
+  throw new Error('unreachable');
+}
+
+const react = (app, who, conversationId, messageId, emoji) => act(app, who, conversationId, messageId, 'reaction', { emoji });
+const edit = (app, who, conversationId, messageId, body) => act(app, who, conversationId, messageId, 'edit', { body });
+
+const E2EE_MIME = 'application/vnd.tealtalk.e2ee';
+const RELOAD = 'Please reload TealTalk to get the encrypted version.';
+
+/** Uploads an encrypted (opaque) file in one request; returns the attachment. */
+async function uploadEncrypted(app, who, bytes = crypto.randomBytes(300)) {
+  const res = await request(app, 'POST', '/api/attachments', { token: who.token, raw: bytes, headers: { 'Content-Type': E2EE_MIME } });
+  if (res.status !== 201) throw new Error(`encrypted upload failed ${res.status} ${res.text}`);
+  return res.body.attachment;
+}
+
+/**
+ * Inserts a legacy (pre-v3, plaintext) message straight into the database, the way old
+ * messages exist after an upgrade. Returns the message view.
+ */
+function insertLegacyMessage(app, { conversationId, senderId, body = '', attachmentId = null, replyToId = null, createdAt = Date.now() }) {
+  return app.store.insertMessage({ conversationId, senderId, clientId: crypto.randomUUID(), body, attachmentId, replyToId, createdAt });
 }
 
 /** A WebSocket client that buffers frames so tests can await specific events. */
@@ -236,8 +356,21 @@ module.exports = {
   startApp,
   request,
   register,
+  putKeys,
   dm,
   send,
+  postEncrypted,
+  makeEnvelope,
+  currentKeyIds,
+  fakeCt,
+  payloadOf,
+  textOf,
+  react,
+  edit,
+  E2EE_MIME,
+  RELOAD,
+  uploadEncrypted,
+  insertLegacyMessage,
   uniqueName,
   WsClient,
   sleep,

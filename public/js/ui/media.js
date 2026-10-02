@@ -1,5 +1,8 @@
 // Photos, videos and voice messages inside message bubbles, and the
 // full-screen photo viewer.
+//
+// Encrypted media has no URL up front: the render model carries `load(onProgress)`
+// and `loadThumb()`, which download, decrypt and resolve to an object URL.
 
 import { h } from '../dom.js';
 import { icon } from './common.js';
@@ -26,6 +29,73 @@ function reserveBox(el, att) {
   }
 }
 
+/** Shown instead of a photo, video or voice message that can't be downloaded or decrypted. */
+export function mediaErrorEl(text, onRetry) {
+  const el = h(
+    'div',
+    { class: 'media-expired media-error', dataset: { testid: 'media-error' }, role: 'img', 'aria-label': text },
+    icon(BROKEN),
+    h('span', { text }),
+  );
+  if (onRetry) {
+    el.appendChild(
+      h('button', {
+        type: 'button',
+        class: 'btn link media-retry',
+        text: 'Try again',
+        onclick: (e) => {
+          e.stopPropagation();
+          onRetry(el);
+        },
+      }),
+    );
+  }
+  return el;
+}
+
+/** Files up to this size are downloaded and decrypted as soon as they're shown. */
+const AUTO_DOWNLOAD_BYTES = 40 * 1024 * 1024;
+/** Thumbnails bigger than this aren't real thumbnails: wait for a tap. */
+const MAX_AUTO_THUMB_BYTES = 1024 * 1024;
+
+/**
+ * May the preview of `att` download by itself? A thumbnail up to 1 MB; with no
+ * thumbnail (the preview is the file itself), the same cap as for videos.
+ */
+function previewAutoLoads(att) {
+  if (att.thumbSize === undefined || att.thumbSize === null) return true; // local or legacy: nothing to fetch
+  return att.hasThumb ? att.thumbSize <= MAX_AUTO_THUMB_BYTES : att.thumbSize <= AUTO_DOWNLOAD_BYTES;
+}
+
+function formatSizeShort(bytes) {
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/** Decrypt the thumbnail into `img` (unless something newer was set meanwhile). */
+function loadThumbInto(img, att) {
+  const loader = att.loadThumb || att.load;
+  if (!loader) return;
+  img.classList.add('loading');
+  loader()
+    .then((url) => {
+      img.classList.remove('loading');
+      if (img.dataset.src) return;
+      img.src = url;
+      img.dataset.src = url;
+    })
+    .catch((err) => {
+      img.classList.remove('loading');
+      if (!img.isConnected || img.dataset.src) return;
+      img.replaceWith(
+        mediaErrorEl(err.message || 'Can’t decrypt this file', (box) => {
+          const again = imageEl(att, { alt: img.alt, onLoad: () => {} });
+          box.replaceWith(again);
+        }),
+      );
+    });
+}
+
 export function imageEl(att, { alt, onLoad }) {
   const img = h('img', {
     class: 'message-image',
@@ -36,15 +106,56 @@ export function imageEl(att, { alt, onLoad }) {
   });
   reserveBox(img, att);
   const src = att.thumbUrl || att.url;
-  img.src = src;
-  img.dataset.src = src;
-  img.dataset.full = att.url || src; // updated when the local preview becomes the server copy
+  if (src) {
+    img.src = src;
+    img.dataset.src = src;
+  } else if (!previewAutoLoads(att)) {
+    return tapToLoadImage(att, img, { alt, onLoad });
+  } else {
+    loadThumbInto(img, att);
+  }
+  img.dataset.full = att.url || src || ''; // updated when the local preview becomes the server copy
+  img.loadFull = att.load || null;
   img.addEventListener('load', onLoad);
   img.addEventListener('click', (e) => {
     if (e.defaultPrevented) return;
-    openViewer({ url: img.dataset.full, thumbUrl: img.currentSrc || img.src, alt: img.alt });
+    const thumbUrl = img.currentSrc || img.src;
+    if (img.loadFull) openViewer({ load: img.loadFull, thumbUrl, alt: img.alt });
+    else openViewer({ url: img.dataset.full, thumbUrl, alt: img.alt });
   });
   return img;
+}
+
+/** A big photo (or an oversized thumbnail): a button first, the picture after a tap. */
+function tapToLoadImage(att, img, { onLoad }) {
+  const box = h('div', { class: 'video-poster secure image-load-box' });
+  reserveBox(box, att);
+  const size = att.thumbSize || att.size || 0;
+  box.appendChild(
+    h(
+      'div',
+      { class: 'media-status' },
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'video-load',
+          dataset: { testid: 'media-load' },
+          'aria-label': `Load photo, ${formatSizeShort(size)}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            box.replaceWith(img);
+            loadThumbInto(img, att);
+          },
+        },
+        icon(DOWNLOAD),
+        h('span', { text: formatSizeShort(size) }),
+      ),
+    ),
+  );
+  img.addEventListener('load', onLoad);
+  return box;
 }
 
 /** Can this device play the file? (e.g. HEVC .mov from an iPhone on an older Android.) */
@@ -61,10 +172,98 @@ function durationBadge(ms) {
   return ms ? h('span', { class: 'video-duration', text: formatDuration(ms) }) : null;
 }
 
-function posterBox(att, extraClass = '') {
+/**
+ * The poster for a video (or the preview while uploading). `onPoster(url)` is
+ * called once the decrypted thumbnail is ready (at once if it already was).
+ */
+function posterBox(att, extraClass = '', onPoster = null) {
   const box = h('div', { class: `video-poster ${extraClass}`.trim() });
   reserveBox(box, att);
-  if (att.thumbUrl) box.appendChild(h('img', { src: att.thumbUrl, alt: '', draggable: 'false' }));
+  if (att.thumbUrl) {
+    box.appendChild(h('img', { src: att.thumbUrl, alt: '', draggable: 'false' }));
+    if (onPoster) onPoster(att.thumbUrl);
+  } else if (att.loadThumb && previewAutoLoads(att)) {
+    const img = h('img', { alt: '', draggable: 'false' });
+    box.appendChild(img);
+    att.loadThumb().then(
+      (url) => {
+        img.src = url;
+        if (onPoster) onPoster(url);
+      },
+      () => img.remove(),
+    );
+  }
+  return box;
+}
+
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/**
+ * An encrypted video: poster first, then download (with progress), decrypt and
+ * swap in the player. Big files wait for a tap. The player gets the poster from
+ * the thumbnail decrypted for the poster box, whenever that arrives.
+ */
+function secureVideoEl(att, { onLoad }) {
+  let posterUrl = att.thumbUrl || null;
+  let player = null;
+  const box = posterBox(att, 'secure', (url) => {
+    posterUrl = url;
+    if (player && player.tagName === 'VIDEO' && !player.poster) player.poster = url;
+  });
+  const status = h('div', { class: 'media-status' });
+  box.appendChild(status);
+  const d = durationBadge(att.durationMs);
+  if (d) box.appendChild(d);
+
+  const start = () => {
+    status.replaceChildren(
+      h('progress', { class: 'media-progress', dataset: { testid: 'media-progress' }, max: '100', value: '0', 'aria-label': 'Downloading video' }),
+    );
+    const bar = status.firstChild;
+    att.load((f) => {
+      bar.value = Math.round(f * 100);
+    }).then(
+      (url) => {
+        if (!box.isConnected) return;
+        player = playerEl({ ...att, url, thumbUrl: posterUrl }, { onLoad });
+        box.replaceWith(player);
+      },
+      (err) => {
+        status.replaceChildren(
+          h('span', { class: 'media-note', text: err.message || 'Can’t decrypt this file' }),
+          err.code === 'undecryptable' || err.code === 'gone'
+            ? null
+            : h('button', { type: 'button', class: 'btn link media-retry', text: 'Try again', onclick: (e) => (e.stopPropagation(), start()) }),
+        );
+      },
+    );
+  };
+
+  if (att.size <= AUTO_DOWNLOAD_BYTES) {
+    start();
+  } else {
+    status.appendChild(
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'video-load',
+          dataset: { testid: 'media-load' },
+          'aria-label': `Load video, ${formatSize(att.size)}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            start();
+          },
+        },
+        icon(PLAY),
+        h('span', { text: formatSize(att.size) }),
+      ),
+    );
+  }
   return box;
 }
 
@@ -89,7 +288,7 @@ function downloadFallback(att) {
 }
 
 export function videoEl(att, { onLoad }) {
-  if (att.pending || !att.url) {
+  if (att.pending || (!att.url && !att.load)) {
     // Still uploading: the poster, with a play mark.
     const box = posterBox(att, 'pending');
     box.appendChild(h('span', { class: 'video-play', 'aria-hidden': 'true' }, icon(PLAY)));
@@ -97,6 +296,11 @@ export function videoEl(att, { onLoad }) {
     if (d) box.appendChild(d);
     return box;
   }
+  if (!att.url && att.load) return secureVideoEl(att, { onLoad });
+  return playerEl(att, { onLoad });
+}
+
+function playerEl(att, { onLoad }) {
   if (!canPlay(att.mime)) return downloadFallback(att);
   const video = h('video', {
     class: 'message-video',
@@ -154,6 +358,26 @@ export function audioEl(att, { label }) {
     audio,
   );
 
+  // Encrypted: decrypt first (voice messages are small), then it plays like any other.
+  let url = att.url || null;
+  let wantPlay = false;
+  if (!url && att.load) {
+    el.classList.add('loading');
+    att.load().then(
+      (u) => {
+        url = u;
+        el.classList.remove('loading');
+        if (!audio.src) audio.src = u;
+        if (wantPlay) button.click();
+      },
+      (err) => {
+        el.classList.remove('loading');
+        el.classList.add('audio-error');
+        time.textContent = err.code === 'undecryptable' ? 'Can’t decrypt' : 'Can’t play';
+      },
+    );
+  }
+
   const duration = () => {
     if (att.durationMs) return att.durationMs / 1000;
     // Recorded WebM often reports Infinity until fully read.
@@ -175,7 +399,12 @@ export function audioEl(att, { label }) {
   };
 
   button.addEventListener('click', () => {
-    if (!audio.src) audio.src = att.url;
+    if (!url) {
+      wantPlay = true;
+      return;
+    }
+    wantPlay = false;
+    if (!audio.src) audio.src = url;
     if (audio.paused) {
       if (playing && playing !== audio) playing.pause();
       playing = audio;
@@ -186,8 +415,8 @@ export function audioEl(att, { label }) {
   });
   const seek = (fraction) => {
     const d = duration();
-    if (!d) return;
-    if (!audio.src) audio.src = att.url;
+    if (!d || !url) return;
+    if (!audio.src) audio.src = url;
     audio.currentTime = Math.max(0, Math.min(d, fraction * d));
     update();
   };
@@ -216,10 +445,11 @@ export function audioEl(att, { label }) {
     update();
   });
   audio.addEventListener('error', () => {
+    if (!audio.src) return;
     el.classList.add('audio-error');
     time.textContent = "Can't play";
   });
-  audio.src = att.url;
+  if (url) audio.src = url;
   return el;
 }
 
@@ -241,18 +471,27 @@ export function expiredEl(kind) {
 let viewer = null;
 let returnFocus = null;
 
-export function openViewer({ url, thumbUrl, alt }) {
+/** load: for encrypted photos, resolves to the decrypted original's URL. */
+export function openViewer({ url, thumbUrl, alt, load }) {
   closeViewer();
   returnFocus = document.activeElement;
   const img = h('img', { class: 'viewer-image', alt: alt || 'Photo', draggable: 'false' });
   // Show the thumbnail at once, then the full-resolution original when it has loaded.
-  img.src = thumbUrl || url;
-  if (url && url !== thumbUrl) {
+  if (thumbUrl || url) img.src = thumbUrl || url;
+  const showFull = (fullUrl) => {
+    if (!fullUrl || fullUrl === thumbUrl) return;
     const full = new Image();
     full.onload = () => {
-      if (viewer && viewer.contains(img)) img.src = url;
+      if (viewer && viewer.contains(img)) img.src = fullUrl;
     };
-    full.src = url;
+    full.src = fullUrl;
+  };
+  if (load) {
+    load().then(showFull, () => {
+      if (viewer && viewer.contains(img)) viewer.classList.add('viewer-failed');
+    });
+  } else {
+    showFull(url);
   }
   const close = h(
     'button',

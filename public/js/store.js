@@ -55,6 +55,7 @@ function persistConversations() {
 }
 
 export function resetState() {
+  clearTimeout(persistTimer); // a cache write still pending must not bring the chat list back
   state.me = null;
   state.conversations.clear();
   state.chats.clear();
@@ -274,7 +275,9 @@ export function addMessages(convId, messages, { silent = false, live = false, si
  */
 function mergeMessage(old, fresh) {
   if (old.deletedAt && !fresh.deletedAt) return old;
-  if ((old.editedAt || 0) > (fresh.editedAt || 0)) return { ...fresh, body: old.body, editedAt: old.editedAt };
+  if ((old.editedAt || 0) > (fresh.editedAt || 0)) {
+    return { ...fresh, body: old.body, e2ee: old.e2ee, e2eeClientId: old.e2eeClientId, editedAt: old.editedAt };
+  }
   return fresh;
 }
 
@@ -292,6 +295,27 @@ export function findMessage(convId, id) {
 }
 
 // ---- message descriptions ----
+
+/**
+ * What a message says, once decrypted (see e2ee.js messageView). Until the
+ * encryption module plugs in, nothing encrypted is readable.
+ */
+let viewProvider = (msg) => ({
+  status: msg && msg.e2ee ? 'pending' : 'legacy',
+  body: (msg && !msg.e2ee && msg.body) || '',
+  attachments: [],
+  legacyAttachment: (msg && !msg.e2ee && msg.attachment) || null,
+  replyTo: null,
+  reactions: {},
+});
+
+export function setViewProvider(fn) {
+  viewProvider = fn;
+}
+
+export function messageView(msg) {
+  return viewProvider(msg);
+}
 
 const KIND_LABEL = { image: 'Photo', video: 'Video', audio: 'Voice message' };
 
@@ -336,10 +360,14 @@ export function messageSummary(conv, msg) {
   if (!msg) return '';
   if (msg.system) return systemText(conv, msg);
   if (msg.deletedAt) return 'This message was unsent';
-  const body = (msg.body || '').replace(/\s+/g, ' ').trim();
+  const view = messageView(msg);
+  if (view.status === 'pending') return '…';
+  if (view.status === 'unverified') return "Couldn't verify this message";
+  if (view.status === 'undecryptable') return "Can't decrypt this message";
+  const body = (view.body || '').replace(/\s+/g, ' ').trim();
   if (body) return body;
-  if (msg.attachment) return kindLabel(attachmentKind(msg.attachment));
-  if (msg.attachmentKind) return kindLabel(msg.attachmentKind);
+  if (view.attachments && view.attachments.length) return kindLabel(view.attachments[0].kind);
+  if (view.legacyAttachment) return kindLabel(attachmentKind(view.legacyAttachment));
   return '';
 }
 

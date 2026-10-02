@@ -277,3 +277,16 @@ Notes on the client:
 - System messages render only as `system-message`, never as `message`.
 - An iPhone `.mov` video is tried in the player even when `canPlayType('video/quicktime')` says no, because most are H.264/HEVC that Android plays. `message-video-download` shows on a playback error.
 - Photos with no GPS pointer are sent byte-for-byte untouched. JPEGs with GPS have it zeroed in place. Anything unreadable that still has a GPS pointer, and non-JPEG formats like HEIC, are re-encoded at full size.
+
+## End-to-end encryption (v3)
+
+All new messages, edits, reactions and files are end-to-end encrypted. **[E2EE.md](E2EE.md) is the binding spec** for keys, envelopes, file records, safety numbers, the key API (`/api/keys...`), the server's 409 delivery checks and the push payload. It overrides anything above about message bodies, attachments, reactions, replies and push previews. Highlights for API users:
+
+- `POST /api/conversations/:id/messages` takes `{ clientId, e2ee, attachmentIds?, replyToId? }`. A plaintext `body` or `attachmentId` gets `400`.
+- `clientId` on messages, edits and reactions must match `^[A-Za-z0-9_-]{1,64}$` (else `400`).
+- `PUT /api/keys`: re-sending the current keyId is a no-op `200`; an older keyId of yours, or a createdAt not newer than your current key's, is `409 { error: "key_rollback" }`; at most 5 key changes per user per 24 hours (`429`); keys must be 91-byte uncompressed P-256 spki.
+- Messages carry `e2ee`, `e2eeClientId`, `attachments: [{ id, size, expired }]`, `replyTo: { id, senderId, deleted }`, `reactions: { userId: Envelope }`, `reactionClientIds`, and `legacyReactions` for pre-v3 rows.
+- Files are uploaded as `application/vnd.tealtalk.e2ee`. `MAX_UPLOAD_MB` applies to the plaintext: an encrypted upload may be up to `MAX + 16 × ceil(MAX / 256 KiB)` bytes.
+- WebSocket event `keys` `{ userId, bundle }` is sent when someone you share a chat with (or you, on another device) publishes a new key.
+
+New client testids: `key-setup-screen`, `recovery-key-screen`, `recovery-key-display`, `recovery-copy-button`, `recovery-confirm-input` (re-type the last group of 4 of the recovery key), `recovery-confirm-button`, `recovery-screen`, `key-conflict-screen` (inside `recovery-screen`: my key was changed on another device), `recovery-input`, `recovery-submit`, `recovery-error`, `recovery-reset-button`, `recovery-logout-button`, `recovery-unconfirmed-note`, `reset-keys-button`, `verify-safety-button` and `verified-badge` (in the 1:1 header, and per member in group info with `data-user-id`), `safety-screen`, `safety-number`, `safety-back`, `mark-verified-button`, `unmark-verified-button`, `safety-change-notice`, `member-change-notice` ("<name> was added to this chat", made by the client), `message-unverified-key-warning`, `message-unencrypted-warning`, `reply-quoted-by-sender`, `safety-interstitial`, `safety-send-anyway`, `safety-verify-again`, `message-undecryptable`, `message-waiting` ("Waiting for <name> to open TealTalk"), `legacy-unencrypted-label`, `media-progress`, `media-load` (tap to download large videos and photos without a thumbnail, over 40 MB, or thumbnails over 1 MB), `media-error`, `app-fingerprint`. Media `src` values are `blob:` URLs of decrypted data. `chat-title`'s text is in an inner span.

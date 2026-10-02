@@ -171,11 +171,55 @@ CREATE INDEX uploads_user ON uploads(user_id);
 CREATE INDEX uploads_created ON uploads(created_at);
 `;
 
+// Version 4: end-to-end encryption (docs/E2EE.md).
+// - key_bundles: every public key bundle a user ever published (kept read-only so old messages
+//   still verify). user_keys: each user's current keyId and encrypted private-key backup.
+// - messages.e2ee: the encrypted envelope JSON (null for legacy plaintext and system messages);
+//   messages.e2ee_client_id: the clientId the current envelope was made with (the message's own
+//   clientId, or the clientId sent with the latest edit).
+// - message_attachments: the opaque encrypted files of an encrypted message, in order. An
+//   attachment can belong to only one message (UNIQUE).
+// - reactions gain e2ee + client_id. Encrypted reactions store emoji = ''. Rows from before v4
+//   keep their plaintext emoji and are shown as `legacyReactions`.
+const MIGRATE_V4 = `
+CREATE TABLE key_bundles (
+  user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key_id      TEXT NOT NULL,
+  bundle      TEXT NOT NULL,
+  uploaded_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, key_id)
+);
+
+CREATE TABLE user_keys (
+  user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  key_id     TEXT NOT NULL,
+  backup     TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (user_id, key_id) REFERENCES key_bundles(user_id, key_id)
+);
+
+ALTER TABLE messages ADD COLUMN e2ee TEXT;
+ALTER TABLE messages ADD COLUMN e2ee_client_id TEXT;
+
+CREATE TABLE message_attachments (
+  message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  attachment_id TEXT NOT NULL UNIQUE REFERENCES attachments(id),
+  position      INTEGER NOT NULL,
+  PRIMARY KEY (message_id, position)
+);
+
+ALTER TABLE reactions ADD COLUMN e2ee TEXT;
+ALTER TABLE reactions ADD COLUMN client_id TEXT;
+
+CREATE INDEX attachments_created ON attachments(created_at);
+`;
+
 /** Ordered migrations; migration i brings the database to `user_version` i + 1. */
 const MIGRATIONS = [
   { sql: SCHEMA_V1, rebuildsTables: false },
   { sql: MIGRATE_V2, rebuildsTables: true },
   { sql: MIGRATE_V3, rebuildsTables: false },
+  { sql: MIGRATE_V4, rebuildsTables: false },
 ];
 const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -184,7 +228,7 @@ const REPLY_PREVIEW_CHARS = 200;
 // Every message query selects these columns from MESSAGE_FROM.
 const MESSAGE_COLUMNS = `
   m.id, m.conversation_id, m.sender_id, m.client_id, m.body, m.attachment_id, m.created_at,
-  m.reply_to_id, m.edited_at, m.deleted_at, m.system_type, m.system_data,
+  m.reply_to_id, m.edited_at, m.deleted_at, m.system_type, m.system_data, m.e2ee, m.e2ee_client_id,
   a.mime AS a_mime, a.size AS a_size, a.kind AS a_kind, a.width AS a_width, a.height AS a_height,
   a.duration_ms AS a_duration_ms, a.thumbnail_id AS a_thumbnail_id, a.expired AS a_expired,
   r.sender_id AS r_sender_id, r.body AS r_body, r.deleted_at AS r_deleted_at, ra.kind AS r_kind`;
@@ -219,27 +263,43 @@ function firstChars(text, n) {
   return chars.length <= n ? chars.join('') : chars.slice(0, n).join('');
 }
 
-function messageView(row, reactions = {}) {
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+const NO_EXTRAS = { reactions: {}, reactionClientIds: {}, legacyReactions: {}, attachments: [] };
+
+/**
+ * The Message shape. Encrypted messages (docs/E2EE.md, "Data shape changes") carry `e2ee`,
+ * `e2eeClientId` (the clientId the envelope's AAD uses: the message's clientId, or the edit's),
+ * `attachments: [{ id, size, expired }]`, `replyTo: { id, senderId, deleted }`, body "" and
+ * attachment null. Legacy plaintext messages keep their v2 fields with `e2ee: null`.
+ * `reactions` is { userId: Envelope } with `reactionClientIds` { userId: clientId }; plaintext
+ * reactions from before v3 are listed in `legacyReactions` { emoji: [userId] }.
+ */
+function messageView(row, extras = NO_EXTRAS) {
   if (!row) return null;
+  const encrypted = row.e2ee !== null && row.e2ee !== undefined;
   let replyTo = null;
   if (row.reply_to_id !== null && row.reply_to_id !== undefined) {
     const deleted = row.r_deleted_at !== null && row.r_deleted_at !== undefined;
-    replyTo = {
-      id: row.reply_to_id,
-      senderId: row.r_sender_id ?? null,
-      body: deleted ? '' : firstChars(row.r_body, REPLY_PREVIEW_CHARS),
-      attachmentKind: deleted ? null : row.r_kind ?? null,
-      deleted,
-    };
+    replyTo = encrypted
+      ? { id: row.reply_to_id, senderId: row.r_sender_id ?? null, deleted }
+      : {
+          id: row.reply_to_id,
+          senderId: row.r_sender_id ?? null,
+          body: deleted ? '' : firstChars(row.r_body, REPLY_PREVIEW_CHARS),
+          attachmentKind: deleted ? null : row.r_kind ?? null,
+          deleted,
+        };
   }
   let system = null;
   if (row.system_type) {
-    let data = {};
-    try {
-      data = JSON.parse(row.system_data || '{}') || {};
-    } catch {
-      /* keep {} */
-    }
+    const data = parseJson(row.system_data || '{}', {}) || {};
     system = {
       type: row.system_type,
       userIds: Array.isArray(data.userIds) ? data.userIds : [],
@@ -265,9 +325,14 @@ function messageView(row, reactions = {}) {
           expired: !!row.a_expired,
         }
       : null,
+    attachments: extras.attachments,
+    e2ee: encrypted ? parseJson(row.e2ee, null) : null,
+    e2eeClientId: encrypted ? row.e2ee_client_id ?? row.client_id : null,
     createdAt: row.created_at,
     replyTo,
-    reactions,
+    reactions: extras.reactions,
+    reactionClientIds: extras.reactionClientIds,
+    legacyReactions: extras.legacyReactions,
     editedAt: row.edited_at ?? null,
     deletedAt: row.deleted_at ?? null,
     system,
@@ -589,28 +654,43 @@ class Store {
 
   // ---- messages ---------------------------------------------------------
 
-  /** { messageId: { emoji: [userId...] } } for the given ids, in the order reactions were made. */
-  reactionsFor(ids) {
+  /** Map messageId -> { reactions, reactionClientIds, legacyReactions, attachments } for the given ids. */
+  extrasFor(ids) {
     const out = new Map();
     if (!ids.length) return out;
-    const rows = this.q(
-      `SELECT message_id, user_id, emoji FROM reactions
-       WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY created_at, rowid`
-    ).all(JSON.stringify(ids));
-    for (const r of rows) {
-      let byEmoji = out.get(r.message_id);
-      if (!byEmoji) {
-        byEmoji = {};
-        out.set(r.message_id, byEmoji);
+    const get = (id) => {
+      let e = out.get(id);
+      if (!e) {
+        e = { reactions: {}, reactionClientIds: {}, legacyReactions: {}, attachments: [] };
+        out.set(id, e);
       }
-      (byEmoji[r.emoji] ||= []).push(r.user_id);
+      return e;
+    };
+    const json = JSON.stringify(ids);
+    const reactions = this.q(
+      `SELECT message_id, user_id, emoji, e2ee, client_id FROM reactions
+       WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY created_at, rowid`
+    ).all(json);
+    for (const r of reactions) {
+      const e = get(r.message_id);
+      if (r.e2ee !== null) {
+        e.reactions[r.user_id] = parseJson(r.e2ee, null);
+        e.reactionClientIds[r.user_id] = r.client_id;
+      } else {
+        (e.legacyReactions[r.emoji] ||= []).push(r.user_id);
+      }
     }
+    const files = this.q(
+      `SELECT ma.message_id, a.id, a.size, a.expired FROM message_attachments ma JOIN attachments a ON a.id = ma.attachment_id
+       WHERE ma.message_id IN (SELECT value FROM json_each(?)) ORDER BY ma.message_id, ma.position`
+    ).all(json);
+    for (const f of files) get(f.message_id).attachments.push({ id: f.id, size: f.size, expired: !!f.expired });
     return out;
   }
 
   views(rows) {
-    const reactions = this.reactionsFor(rows.map((r) => r.id));
-    return rows.map((row) => messageView(row, reactions.get(row.id) || {}));
+    const extras = this.extrasFor(rows.map((r) => r.id));
+    return rows.map((row) => messageView(row, extras.get(row.id) || { reactions: {}, reactionClientIds: {}, legacyReactions: {}, attachments: [] }));
   }
 
   view(row) {
@@ -650,10 +730,22 @@ class Store {
   }
 
   /** Inserts a message and bumps the conversation; call inside a transaction. Returns the view. */
-  insertMessageRow({ conversationId, senderId, clientId, body, attachmentId = null, replyToId = null, createdAt, systemType = null, systemData = null }) {
+  insertMessageRow({
+    conversationId,
+    senderId,
+    clientId,
+    body,
+    attachmentId = null,
+    replyToId = null,
+    createdAt,
+    systemType = null,
+    systemData = null,
+    e2ee = null,
+    attachmentIds = [],
+  }) {
     const info = this.q(
-      `INSERT INTO messages (conversation_id, sender_id, client_id, body, attachment_id, reply_to_id, created_at, system_type, system_data)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (conversation_id, sender_id, client_id, body, attachment_id, reply_to_id, created_at, system_type, system_data, e2ee, e2ee_client_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       conversationId,
       senderId,
@@ -663,10 +755,15 @@ class Store {
       replyToId,
       createdAt,
       systemType,
-      systemData ? JSON.stringify(systemData) : null
+      systemData ? JSON.stringify(systemData) : null,
+      e2ee ? JSON.stringify(e2ee) : null,
+      e2ee ? clientId : null
     );
+    const id = Number(info.lastInsertRowid);
+    const link = this.q('INSERT INTO message_attachments (message_id, attachment_id, position) VALUES (?, ?, ?)');
+    attachmentIds.forEach((attId, i) => link.run(id, attId, i));
     this.q('UPDATE conversations SET updated_at = ? WHERE id = ?').run(createdAt, conversationId);
-    return this.getMessage(Number(info.lastInsertRowid));
+    return this.getMessage(id);
   }
 
   insertMessage(fields) {
@@ -685,13 +782,18 @@ class Store {
     return info.changes > 0;
   }
 
-  /** Sets (or replaces) a user's reaction. Returns true if anything changed. */
-  setReaction(messageId, userId, emoji, createdAt) {
+  /**
+   * Sets (or replaces) a user's encrypted reaction; it also replaces a legacy plaintext one.
+   * Returns true if anything changed (the same envelope again changes nothing).
+   */
+  setReaction(messageId, userId, envelope, clientId, createdAt) {
+    const json = JSON.stringify(envelope);
     const info = this.q(
-      `INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(message_id, user_id) DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at
-       WHERE reactions.emoji <> excluded.emoji`
-    ).run(messageId, userId, emoji, createdAt);
+      `INSERT INTO reactions (message_id, user_id, emoji, e2ee, client_id, created_at) VALUES (?, ?, '', ?, ?, ?)
+       ON CONFLICT(message_id, user_id) DO UPDATE SET emoji = '', e2ee = excluded.e2ee, client_id = excluded.client_id,
+         created_at = excluded.created_at
+       WHERE reactions.e2ee IS NOT excluded.e2ee`
+    ).run(messageId, userId, json, clientId, createdAt);
     return info.changes > 0;
   }
 
@@ -699,9 +801,22 @@ class Store {
     return this.q('DELETE FROM reactions WHERE message_id = ? AND user_id = ?').run(messageId, userId).changes > 0;
   }
 
-  editMessage(id, body, editedAt) {
-    this.q('UPDATE messages SET body = ?, edited_at = ? WHERE id = ?').run(body, editedAt, id);
+  /** Replaces an encrypted message's envelope with an edit envelope. */
+  editMessage(id, envelope, clientId, editedAt) {
+    this.q('UPDATE messages SET e2ee = ?, e2ee_client_id = ?, edited_at = ? WHERE id = ?').run(
+      JSON.stringify(envelope),
+      clientId,
+      editedAt,
+      id
+    );
     return this.getMessage(id);
+  }
+
+  /** Ids of an encrypted message's files, in order. */
+  messageAttachmentIds(messageId) {
+    return this.q('SELECT attachment_id FROM message_attachments WHERE message_id = ? ORDER BY position')
+      .all(messageId)
+      .map((r) => r.attachment_id);
   }
 
   /** Ids of messages whose reply quote shows message `id`. */
@@ -718,12 +833,18 @@ class Store {
     return this.transaction(() => {
       const msg = this.getMessageRow(id);
       if (!msg || msg.deleted_at !== null) return [];
+      const encryptedFiles = this.messageAttachmentIds(id);
       this.q(
-        `UPDATE messages SET body = '', attachment_id = NULL, reply_to_id = NULL, edited_at = NULL, deleted_at = ?
+        `UPDATE messages SET body = '', attachment_id = NULL, reply_to_id = NULL, edited_at = NULL, deleted_at = ?,
+           e2ee = NULL, e2ee_client_id = NULL
          WHERE id = ?`
       ).run(deletedAt, id);
       this.q('DELETE FROM reactions WHERE message_id = ?').run(id);
+      this.q('DELETE FROM message_attachments WHERE message_id = ?').run(id);
       const files = [];
+      for (const attId of encryptedFiles) {
+        if (this.forgetAttachmentIfUnused(attId)) files.push(attId);
+      }
       if (msg.attachment_id) {
         const att = this.getAttachment(msg.attachment_id);
         if (att && this.forgetAttachmentIfUnused(att.id)) {
@@ -738,8 +859,7 @@ class Store {
   /** Deletes an attachment row if no message or other attachment refers to it. */
   forgetAttachmentIfUnused(attachmentId) {
     const used =
-      this.q('SELECT 1 AS x FROM messages WHERE attachment_id = ? LIMIT 1').get(attachmentId) ||
-      this.q('SELECT 1 AS x FROM attachments WHERE thumbnail_id = ? LIMIT 1').get(attachmentId);
+      this.attachmentInUse(attachmentId) || this.q('SELECT 1 AS x FROM attachments WHERE thumbnail_id = ? LIMIT 1').get(attachmentId);
     if (used) return false;
     this.q('DELETE FROM attachments WHERE id = ?').run(attachmentId);
     return true;
@@ -759,18 +879,31 @@ class Store {
     return this.q('SELECT * FROM attachments WHERE id = ?').get(id) || null;
   }
 
+  /** True if a message (legacy or encrypted) carries this attachment. */
   attachmentInUse(id) {
-    return !!this.q('SELECT 1 AS x FROM messages WHERE attachment_id = ? LIMIT 1').get(id);
+    return !!(
+      this.q('SELECT 1 AS x FROM messages WHERE attachment_id = ? LIMIT 1').get(id) ||
+      this.q('SELECT 1 AS x FROM message_attachments WHERE attachment_id = ? LIMIT 1').get(id)
+    );
   }
 
   /**
    * The uploader may always read an attachment. Others must be a member of a conversation where
-   * a message they are allowed to see carries it, or carries an attachment whose thumbnail it is.
+   * a message they are allowed to see carries it (as a legacy attachment or one of an encrypted
+   * message's files), or carries a legacy attachment whose thumbnail it is.
    */
   canReadAttachment(attachmentId, userId) {
     const att = this.getAttachment(attachmentId);
     if (!att) return false;
     if (att.uploader_id === userId) return true;
+    const encrypted = this.q(
+      `SELECT 1 AS x FROM message_attachments ma
+       JOIN messages msg ON msg.id = ma.message_id
+       JOIN members mem ON mem.conversation_id = msg.conversation_id AND mem.user_id = ?
+       WHERE ma.attachment_id = ? AND msg.id >= mem.visible_from
+       LIMIT 1`
+    ).get(userId, attachmentId);
+    if (encrypted) return true;
     return !!this.q(
       `SELECT 1 AS x FROM messages msg
        JOIN members mem ON mem.conversation_id = msg.conversation_id AND mem.user_id = ?
@@ -790,6 +923,85 @@ class Store {
       }
       return ids;
     });
+  }
+
+  /**
+   * Deletes attachments created before `cutoff` that no message ever carried (abandoned sends,
+   * thumbnails of cancelled uploads). A legacy thumbnail counts as carried while the attachment
+   * that uses it is. Returns their ids (files to delete).
+   */
+  deleteUnattachedBefore(cutoff) {
+    return this.transaction(() => {
+      const ids = this.q(
+        `SELECT a.id FROM attachments a
+         WHERE a.created_at < ?
+           AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id = a.id)
+           AND NOT EXISTS (SELECT 1 FROM message_attachments ma WHERE ma.attachment_id = a.id)
+           AND NOT EXISTS (SELECT 1 FROM attachments p JOIN messages pm ON pm.attachment_id = p.id WHERE p.thumbnail_id = a.id)`
+      )
+        .all(cutoff)
+        .map((r) => r.id);
+      if (ids.length) {
+        this.q('DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify(ids));
+      }
+      return ids;
+    });
+  }
+
+  // ---- key directory -------------------------------------------------------
+
+  /**
+   * Publishes `bundle` as the user's current key with its backup. Earlier bundles stay in
+   * key_bundles (read-only). Re-sending the current keyId changes nothing. A keyId the user published
+   * before that isn't current, or a createdAt not newer than the current key's, is refused: an old
+   * key never becomes current again (rollback protection).
+   * Returns { bundle, changed } (changed: the current keyId moved) or { rollback: true }.
+   */
+  putKeys(userId, bundle, backup, now) {
+    return this.transaction(() => {
+      const before = this.getOwnKeys(userId);
+      if (before && before.bundle && before.bundle.keyId === bundle.keyId) return { bundle: before.bundle, changed: false };
+      if (this.getBundle(userId, bundle.keyId)) return { rollback: true };
+      if (before && before.bundle && !(bundle.createdAt > before.bundle.createdAt)) return { rollback: true };
+      this.q('INSERT INTO key_bundles (user_id, key_id, bundle, uploaded_at) VALUES (?, ?, ?, ?)').run(
+        userId,
+        bundle.keyId,
+        JSON.stringify(bundle),
+        now
+      );
+      this.q(
+        `INSERT INTO user_keys (user_id, key_id, backup, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET key_id = excluded.key_id, backup = excluded.backup, updated_at = excluded.updated_at`
+      ).run(userId, bundle.keyId, JSON.stringify(backup), now);
+      return { bundle: this.getBundle(userId, bundle.keyId), changed: true };
+    });
+  }
+
+  /** { bundle, backup } of the user's current key, or null. */
+  getOwnKeys(userId) {
+    const row = this.q(
+      `SELECT k.backup, b.bundle FROM user_keys k JOIN key_bundles b ON b.user_id = k.user_id AND b.key_id = k.key_id
+       WHERE k.user_id = ?`
+    ).get(userId);
+    return row ? { bundle: parseJson(row.bundle, null), backup: parseJson(row.backup, null) } : null;
+  }
+
+  /** A bundle the user published (current or older), or null. */
+  getBundle(userId, keyId) {
+    const row = this.q('SELECT bundle FROM key_bundles WHERE user_id = ? AND key_id = ?').get(userId, keyId);
+    return row ? parseJson(row.bundle, null) : null;
+  }
+
+  /** Map userId -> { keyId, bundle } of current keys, for those of `userIds` that have keys. */
+  currentKeys(userIds) {
+    const out = new Map();
+    if (!userIds.length) return out;
+    const rows = this.q(
+      `SELECT k.user_id, k.key_id, b.bundle FROM user_keys k JOIN key_bundles b ON b.user_id = k.user_id AND b.key_id = k.key_id
+       WHERE k.user_id IN (SELECT value FROM json_each(?))`
+    ).all(JSON.stringify(userIds));
+    for (const r of rows) out.set(r.user_id, { keyId: r.key_id, bundle: parseJson(r.bundle, null) });
+    return out;
   }
 
   // ---- resumable uploads ---------------------------------------------------

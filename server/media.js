@@ -20,6 +20,9 @@ const MEDIA_TYPES = new Map([
   ['audio/mpeg', 'audio'],
   ['audio/webm', 'audio'],
   ['audio/ogg', 'audio'],
+  // Encrypted files (docs/E2EE.md): opaque bytes, never sniffed. The real type is inside the
+  // encrypted message payload.
+  ['application/vnd.tealtalk.e2ee', 'e2ee'],
 ]);
 
 /** Bytes needed from the start of a file to recognize it. */
@@ -118,10 +121,12 @@ function partFile(uploadsDir, uploadId) {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UPLOAD_TTL_MS = DAY_MS;
+const UNATTACHED_TTL_MS = 7 * DAY_MS;
 
 /**
  * Hourly housekeeping: deletes media older than MEDIA_RETENTION_DAYS (the message keeps an
- * `expired: true` attachment) and resumable uploads left unfinished for 24 hours.
+ * `expired: true` attachment), files that were uploaded but never attached to any message for
+ * 7 days (cancelled sends, their thumbnails), and resumable uploads left unfinished for 24 hours.
  */
 class MediaSweeper {
   constructor({ store, uploadsDir, retentionDays = 0, intervalMs = 60 * 60 * 1000, now = Date.now, log = console }) {
@@ -134,9 +139,9 @@ class MediaSweeper {
     this.timer.unref();
   }
 
-  /** Runs one sweep now. Returns { expired: [attachmentId], abandoned: [uploadId] }. */
+  /** Runs one sweep now. Returns { expired: [attachmentId], unattached: [attachmentId], abandoned: [uploadId] }. */
   sweep() {
-    const result = { expired: [], abandoned: [] };
+    const result = { expired: [], unattached: [], abandoned: [] };
     if (this.store.closed) return result;
     try {
       const now = this.now();
@@ -144,6 +149,8 @@ class MediaSweeper {
         result.expired = this.store.expireAttachmentsBefore(now - this.retentionDays * DAY_MS);
         removeFiles(this.uploadsDir, result.expired);
       }
+      result.unattached = this.store.deleteUnattachedBefore(now - UNATTACHED_TTL_MS);
+      removeFiles(this.uploadsDir, result.unattached);
       result.abandoned = this.store.deleteUploadsBefore(now - UPLOAD_TTL_MS);
       removeFiles(
         this.uploadsDir,
@@ -172,4 +179,5 @@ module.exports = {
   partFile,
   MediaSweeper,
   UPLOAD_TTL_MS,
+  UNATTACHED_TTL_MS,
 };
