@@ -9,7 +9,7 @@
 
 import { Api } from './api.js';
 import { storage, uuid } from './dom.js';
-import { state, on, emit, addMessages, pendingFor } from './store.js';
+import { state, on, emit, addMessages, pendingFor, liveNow } from './store.js';
 import { uploadBlob, abandonUpload, UploadCancelled } from './uploads.js';
 
 const OUTBOX_KEY = 'tt.outbox';
@@ -170,6 +170,7 @@ export async function flush() {
 }
 
 async function sendOne(p) {
+  const since = liveNow();
   try {
     const { message } = await Api.sendMessage(p.conversationId, {
       clientId: p.clientId,
@@ -177,8 +178,9 @@ async function sendOne(p) {
       attachmentId: p.attachmentId,
       replyToId: p.replyToId,
     });
-    // addMessages resolves the pending entry by clientId.
-    addMessages(p.conversationId, [message]);
+    // addMessages resolves the pending entry by clientId (unless the socket's copy,
+    // perhaps already with a reaction, came first and did).
+    addMessages(p.conversationId, [message], { since });
     if (state.pending.has(p.clientId)) state.pending.delete(p.clientId);
     persist();
     return true;
@@ -252,7 +254,11 @@ async function uploadOne(p) {
     persist();
     emit('messages', p.conversationId);
   } catch (err) {
-    if (err instanceof UploadCancelled || !state.pending.has(p.clientId)) return;
+    if (err instanceof UploadCancelled || !state.pending.has(p.clientId)) {
+      // Cancelled while the server was still creating the upload: discard() had no id to free yet.
+      abandonUpload(b.job);
+      return;
+    }
     if (err.isTransient || err.status === 401) {
       // Dropped connection: resume from where the server got to, a bit later
       // (or right away when the network comes back: flush() skips the wait).

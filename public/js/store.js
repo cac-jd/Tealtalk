@@ -63,6 +63,7 @@ export function resetState() {
   state.typing.clear();
   state.online.clear();
   state.users.clear();
+  liveAt.clear();
   storage.remove(CONV_CACHE_KEY);
   storage.remove(ME_KEY);
 }
@@ -181,7 +182,9 @@ export function applyRead(convId, userId, messageId) {
       const chat = state.chats.get(convId);
       if (chat && chat.loaded) {
         let n = 0;
-        for (const m of chat.messages.values()) if (m.senderId !== userId && m.id > messageId) n++;
+        for (const m of chat.messages.values()) {
+          if (m.senderId !== userId && m.id > messageId && !m.system && !m.deletedAt) n++;
+        }
         next.unreadCount = n;
       }
     }
@@ -204,14 +207,38 @@ export function getChat(convId) {
 }
 
 /**
+ * The socket delivers every change in the server's order, but an HTTP reply (to a
+ * reaction, an edit, a send, or a page of history) can arrive after a newer copy
+ * of the same message already came over the socket. Each socket copy gets a stamp
+ * from this clock; a reply fetched when the clock read `since` is stale for any
+ * message stamped later.
+ */
+let liveClock = 0;
+/** message id -> liveClock when its newest socket copy arrived */
+const liveAt = new Map();
+
+export function liveNow() {
+  return liveClock;
+}
+
+/** Did a socket copy of this message arrive after `since`? */
+export function arrivedLiveSince(messageId, since) {
+  return (liveAt.get(messageId) || 0) > since;
+}
+
+/**
  * Merge server messages into a conversation. Returns the messages that were new.
  * Also resolves pending (optimistic) messages that share a clientId.
+ * `live`: they came over the WebSocket. `since`: they come from an HTTP reply
+ * requested at liveNow() === since; copies the socket has replaced meanwhile are skipped.
  */
-export function addMessages(convId, messages, { silent = false } = {}) {
+export function addMessages(convId, messages, { silent = false, live = false, since = null } = {}) {
   const chat = getChat(convId);
   const added = [];
   let newest = null;
   for (const incoming of messages) {
+    if (live) liveAt.set(incoming.id, ++liveClock);
+    else if (since !== null && chat.messages.has(incoming.id) && arrivedLiveSince(incoming.id, since)) continue;
     const old = chat.messages.get(incoming.id);
     // Same id again (a reaction, edit or unsend): replace it in place, never duplicate.
     const msg = old ? mergeMessage(old, incoming) : incoming;
@@ -340,6 +367,16 @@ export function incrementUnread(convId) {
   const conv = state.conversations.get(convId);
   if (!conv) return;
   state.conversations.set(convId, { ...conv, unreadCount: (conv.unreadCount || 0) + 1 });
+  persistConversations();
+  emit('conversations');
+}
+
+/** A message I hadn't read yet was unsent: it no longer counts. */
+export function uncountUnread(convId, messageId) {
+  const conv = state.conversations.get(convId);
+  if (!conv || !conv.unreadCount || !state.me) return;
+  if (((conv.readUpTo || {})[state.me.id] || 0) >= messageId) return;
+  state.conversations.set(convId, { ...conv, unreadCount: conv.unreadCount - 1 });
   persistConversations();
   emit('conversations');
 }

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node --no-warnings=ExperimentalWarning server/index.js",
     "test": "node --no-warnings=ExperimentalWarning --test tests/*.test.js",
-    "test:e2e": "node tests/e2e/cross-platform.e2e.js"
+    "test:e2e": "node tests/e2e/cross-platform.e2e.js && node tests/e2e/media-and-reactions.e2e.js"
   },
   "license": "MIT",
   "dependencies": {

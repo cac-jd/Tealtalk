@@ -12,258 +12,39 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const zlib = require('node:zlib');
-const { execSync } = require('node:child_process');
 const { createApp } = require('../../server');
-
-function loadPlaywright() {
-  try {
-    const root = execSync('npm root -g', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-    return require(path.join(root, 'playwright'));
-  } catch {
-    return require('playwright');
-  }
-}
+const {
+  PASSWORD,
+  loadPlaywright,
+  createRunner,
+  runMain,
+  assert,
+  sleep,
+  until,
+  sunsetPng,
+  deviceFactory,
+  tid,
+  text,
+  messagesWithBody,
+  register,
+  login,
+  openConversation,
+  sendText,
+  statusOf,
+  waitStatus,
+  countWithBody,
+  bubbleColor,
+  parseRgb,
+  isBlue,
+  layoutReport,
+} = require('./harness');
 
 const OVERALL_TIMEOUT_MS = 180000;
 // Report and route service-worker fetches too (Chromium). context.setOffline() does not
 // cut the service worker's own network, so "offline" below also aborts its requests.
 process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = '1';
-const PASSWORD = 'teal-talk-e2e-pass';
 
-// ---------------------------------------------------------------------------
-// tiny harness
-
-const results = [];
-let aborted = false;
-
-async function check(name, fn, { critical = false } = {}) {
-  if (aborted) {
-    results.push({ name, ok: false, skipped: true });
-    console.log(`SKIP  ${name}`);
-    return;
-  }
-  const started = Date.now();
-  try {
-    await fn();
-    results.push({ name, ok: true });
-    console.log(`PASS  ${name} (${Date.now() - started} ms)`);
-  } catch (err) {
-    results.push({ name, ok: false, err });
-    console.log(`FAIL  ${name}\n      ${String((err && err.message) || err).split('\n').join('\n      ')}`);
-    if (critical) aborted = true;
-  }
-}
-
-function assert(cond, message) {
-  if (!cond) throw new Error(message);
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** Poll `fn` until it returns a truthy value. */
-async function until(desc, fn, timeout = 10000) {
-  const end = Date.now() + timeout;
-  let last;
-  for (;;) {
-    try {
-      last = await fn();
-      if (last) return last;
-    } catch (err) {
-      last = err;
-    }
-    if (Date.now() > end) break;
-    await sleep(100);
-  }
-  const detail = last instanceof Error ? last.message : JSON.stringify(last);
-  throw new Error(`timed out waiting for ${desc} (last: ${detail})`);
-}
-
-// ---------------------------------------------------------------------------
-// a small PNG, generated in-script (a sunset over the sea)
-
-const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  return c >>> 0;
-});
-
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length);
-  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body));
-  return Buffer.concat([len, body, crc]);
-}
-
-function makePng(w, h, pixel) {
-  const raw = Buffer.alloc((w * 3 + 1) * h);
-  for (let y = 0; y < h; y++) {
-    const row = y * (w * 3 + 1);
-    raw[row] = 0;
-    for (let x = 0; x < w; x++) {
-      const [r, g, b] = pixel(x, y);
-      raw[row + 1 + x * 3] = r;
-      raw[row + 2 + x * 3] = g;
-      raw[row + 3 + x * 3] = b;
-    }
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(w, 0);
-  ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // RGB
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', zlib.deflateSync(raw)),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
-
-function sunsetPng(w = 320, h = 240) {
-  const horizon = Math.round(h * 0.62);
-  return makePng(w, h, (x, y) => {
-    const sun = Math.hypot(x - w * 0.66, y - horizon + 6) < h * 0.15;
-    const hill = y > horizon - 26 + 18 * Math.sin(x / 38) + 10 * Math.cos(x / 17) && x < w * 0.45;
-    if (y < horizon) {
-      if (sun) return [255, 244, 214];
-      if (hill) return [19, 78, 74];
-      return mix([253, 230, 138], [249, 115, 22], y / horizon);
-    }
-    const t = (y - horizon) / (h - horizon);
-    const glint = Math.abs(x - w * 0.66) < 30 * (1 - t) && (y + Math.round(x / 7)) % 9 < 2;
-    return glint ? [254, 215, 170] : mix([20, 184, 166], [15, 78, 74], t);
-  });
-}
-
-// ---------------------------------------------------------------------------
-// page helpers (data-testid only)
-
-const tid = (page, id) => page.getByTestId(id);
-
-async function text(locator) {
-  return ((await locator.textContent()) || '').trim();
-}
-
-function messagesWithBody(page, body) {
-  return tid(page, 'message').filter({ has: page.getByTestId('message-body').getByText(body, { exact: true }) });
-}
-
-async function register(page, url, username, displayName) {
-  await page.goto(url);
-  await tid(page, 'auth-screen').waitFor();
-  await tid(page, 'auth-toggle').click();
-  await tid(page, 'auth-username').fill(username);
-  await tid(page, 'auth-displayname').fill(displayName);
-  await tid(page, 'auth-password').fill(PASSWORD);
-  await tid(page, 'auth-submit').click();
-  await tid(page, 'chats-screen').waitFor();
-}
-
-async function login(page, username) {
-  await tid(page, 'auth-screen').waitFor();
-  await tid(page, 'auth-username').fill(username);
-  await tid(page, 'auth-password').fill(PASSWORD);
-  await tid(page, 'auth-submit').click();
-  await tid(page, 'chats-screen').waitFor();
-}
-
-async function openConversation(page, convId) {
-  await page.locator(`[data-testid="conversation-item"][data-conversation-id="${convId}"]`).click();
-  await tid(page, 'chat-screen').waitFor();
-}
-
-async function sendText(page, body) {
-  await tid(page, 'message-input').fill(body);
-  await tid(page, 'send-button').click();
-}
-
-async function statusOf(page, body) {
-  const msg = messagesWithBody(page, body);
-  if ((await msg.count()) !== 1) return null;
-  return text(msg.getByTestId('message-status'));
-}
-
-async function waitStatus(page, body, expected, timeout = 10000) {
-  await until(`"${body}" to be ${expected}`, async () => (await statusOf(page, body)) === expected, timeout);
-}
-
-async function countWithBody(page, body) {
-  return messagesWithBody(page, body).count();
-}
-
-/** Background colour of the bubble inside a message element (first painted box). */
-function bubbleColor(locator) {
-  return locator.evaluate((el) => {
-    for (const node of [el, ...el.querySelectorAll('*')]) {
-      const c = getComputedStyle(node).backgroundColor;
-      if (c && c !== 'transparent' && c !== 'rgba(0, 0, 0, 0)') return c;
-    }
-    return null;
-  });
-}
-
-function parseRgb(css) {
-  const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(css || '');
-  return m ? m.slice(1, 4).map(Number) : null;
-}
-
-function isBlue(css) {
-  const rgb = parseRgb(css);
-  if (!rgb) return false;
-  const [r, g, b] = rgb.map((v) => v / 255);
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const d = max - min;
-  if (max === 0 || d / max < 0.25) return false; // grey-ish
-  let hue;
-  if (max === r) hue = 60 * (((g - b) / d) % 6);
-  else if (max === g) hue = 60 * ((b - r) / d + 2);
-  else hue = 60 * ((r - g) / d + 4);
-  if (hue < 0) hue += 360;
-  return hue >= 195 && hue <= 260;
-}
-
-/** Layout sanity: nothing wider than the viewport, key controls fully on screen. */
-function layoutReport(page) {
-  return page.evaluate(() => {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const doc = document.documentElement;
-    const problems = [];
-    if (doc.scrollWidth > vw + 1) problems.push(`page scrollWidth ${doc.scrollWidth} > ${vw}`);
-    const visible = (el) => el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
-    for (const el of document.querySelectorAll('[data-testid]')) {
-      if (!visible(el)) continue;
-      const id = el.getAttribute('data-testid');
-      if (id === 'attach-input') continue; // visually hidden file input
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) continue;
-      if (r.left < -1 || r.right > vw + 1) problems.push(`${id} spans x ${Math.round(r.left)}..${Math.round(r.right)} (viewport ${vw})`);
-    }
-    for (const id of ['message-input', 'send-button', 'chat-title', 'back-button']) {
-      const el = document.querySelector(`[data-testid="${id}"]`);
-      if (!visible(el)) continue;
-      const r = el.getBoundingClientRect();
-      if (r.top < 0 || r.bottom > vh + 1) problems.push(`${id} is off screen vertically (${Math.round(r.top)}..${Math.round(r.bottom)}, viewport ${vh})`);
-    }
-    for (const img of document.querySelectorAll('[data-testid="message-image"]')) {
-      const r = img.getBoundingClientRect();
-      if (r.right > vw + 1) problems.push(`message-image overflows to x=${Math.round(r.right)}`);
-    }
-    return problems;
-  });
-}
+const { check, summary } = createRunner();
 
 // ---------------------------------------------------------------------------
 
@@ -288,30 +69,13 @@ async function main() {
   const EXPECTED_OFFLINE = /net::ERR_INTERNET_DISCONNECTED/;
 
   const browser = await chromium.launch();
-  const strip = ({ defaultBrowserType, ...d }) => d; // eslint-disable-line no-unused-vars
-
-  async function device(label, descriptor, extra = {}) {
-    const context = await browser.newContext({ ...strip(descriptor), ...extra });
-    const watch = (url) => {
-      if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('about:')) return;
-      let host;
-      try {
-        host = new URL(url).host;
-      } catch {
-        host = url;
-      }
-      if (host !== serverHost) foreignRequests.push(`${label}: ${url}`);
-    };
-    context.on('request', (req) => watch(req.url()));
-    const page = await context.newPage();
-    page.on('request', (req) => watch(req.url()));
-    page.on('websocket', (ws) => watch(ws.url()));
-    page.on('console', (msg) => {
-      if (msg.type() === 'error' && !EXPECTED_OFFLINE.test(msg.text())) consoleErrors.push(`${label}: ${msg.text()}`);
-    });
-    page.on('pageerror', (err) => consoleErrors.push(`${label} pageerror: ${err.message}`));
-    return { context, page };
-  }
+  const device = deviceFactory({
+    browser,
+    serverHost,
+    foreignRequests,
+    consoleErrors,
+    expectedError: (msg) => EXPECTED_OFFLINE.test(msg),
+  });
 
   const iphone = await device('iPhone', devices['iPhone 13']);
   const android = await device('Android', devices['Pixel 7']);
@@ -811,25 +575,7 @@ async function main() {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 
-  const failed = results.filter((r) => !r.ok);
-  const passed = results.length - failed.length;
-  console.log(`\n${passed}/${results.length} checks passed${failed.length ? `, ${failed.length} failed` : ''} (origin ${origin})`);
-  return failed.length === 0;
+  return summary(origin);
 }
 
-const watchdog = setTimeout(() => {
-  console.log(`FAIL  e2e run exceeded ${OVERALL_TIMEOUT_MS / 1000}s`);
-  process.exit(1);
-}, OVERALL_TIMEOUT_MS);
-
-main().then(
-  (ok) => {
-    clearTimeout(watchdog);
-    process.exit(ok ? 0 : 1);
-  },
-  (err) => {
-    clearTimeout(watchdog);
-    console.log(`FAIL  e2e crashed: ${(err && err.stack) || err}`);
-    process.exit(1);
-  },
-);
+runMain(main, OVERALL_TIMEOUT_MS);

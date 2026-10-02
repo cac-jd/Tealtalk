@@ -56,7 +56,8 @@ See [docs/DEPLOY.md](docs/DEPLOY.md). It starts with a free way to try TealTalk 
 
 ```sh
 npm test            # server integration tests
-npm run test:e2e    # browser test: an iPhone user and an Android user chatting (needs Playwright + Chromium)
+npm run test:e2e    # browser tests: an iPhone user and an Android user chatting, sending full-quality photos,
+                    # videos and voice messages, reacting, replying and running a group (needs Playwright + Chromium)
 ```
 
 ## Known limitations (prototype)

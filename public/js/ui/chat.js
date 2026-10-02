@@ -12,6 +12,8 @@ import {
   addMessages,
   replaceMessage,
   findMessage,
+  liveNow,
+  arrivedLiveSince,
   sortedMessages,
   pendingFor,
   messageStatus,
@@ -157,6 +159,7 @@ async function fetchLatest(id) {
   const chat = getChat(id);
   let knownNewest = 0;
   for (const m of chat.messages.values()) if (m.id > knownNewest) knownNewest = m.id;
+  const since = liveNow(); // reactions etc. that arrive live meanwhile are newer than these pages
 
   const { messages } = await Api.messages(id, { limit: PAGE });
   let batch = messages;
@@ -179,7 +182,7 @@ async function fetchLatest(id) {
     chat.hasMore = lastPageFull;
   }
   chat.loaded = true;
-  addMessages(id, batch, { silent: true });
+  addMessages(id, batch, { silent: true, since });
 }
 
 /** Called after the socket (re)connects. */
@@ -213,11 +216,12 @@ async function loadOlder() {
   const status = $('older-status');
   status.textContent = 'Loading earlier messages…';
   status.hidden = false;
+  const since = liveNow();
   try {
     const { messages } = await Api.messages(id, { before: msgs[0].id, limit: PAGE });
     chat.hasMore = messages.length === PAGE;
     if (id !== convId) return false;
-    addMessages(id, messages, { silent: true });
+    addMessages(id, messages, { silent: true, since });
     render({ preserveFromBottom: true });
     return messages.length > 0;
   } catch {
@@ -922,13 +926,16 @@ async function react(item, emoji) {
   }
   if (!removing) reactions[emoji] = [...(reactions[emoji] || []), meId];
   replaceMessage(id, { ...msg, reactions });
+  // A copy that comes over the socket meanwhile is newer than this request's reply,
+  // which then must not overwrite it (the socket brings our own change too).
+  const since = liveNow();
   try {
     const { message } = removing ? await Api.unreact(id, msg.id) : await Api.react(id, msg.id, emoji);
-    addMessages(id, [message]);
+    addMessages(id, [message], { since });
     announce(removing ? 'Reaction removed' : `Reacted with ${emoji}`);
   } catch (err) {
     const now = findMessage(id, msg.id);
-    if (now) replaceMessage(id, { ...now, reactions: msg.reactions });
+    if (now && !arrivedLiveSince(msg.id, since)) replaceMessage(id, { ...now, reactions: msg.reactions });
     toast(err.message || 'Could not react to that message.');
   }
 }
@@ -1044,9 +1051,10 @@ async function saveEdit() {
   setEditing(null);
   if (body === msg.body) return;
   replaceMessage(id, { ...msg, body, editedAt: Date.now() });
+  const since = liveNow(); // see react()
   try {
     const { message } = await Api.editMessage(id, msg.id, body);
-    addMessages(id, [message]);
+    addMessages(id, [message], { since });
     announce('Message edited');
   } catch (err) {
     const now = findMessage(id, msg.id);

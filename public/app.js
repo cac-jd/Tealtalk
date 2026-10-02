@@ -13,6 +13,8 @@ import {
   addMessages,
   applyRead,
   incrementUnread,
+  uncountUnread,
+  findMessage,
   setTyping,
   clearTyping,
   setPresence,
@@ -99,6 +101,10 @@ function handleEvent(evt) {
 
 async function handleIncoming(message) {
   const convId = message.conversationId;
+  // Ids only grow, so a message at or below the newest one we know of is a change to an
+  // existing message (reaction, edit, unsend), even when this chat's history isn't loaded.
+  const knownConv = getConversation(convId);
+  const known = knownConv && knownConv.lastMessage ? knownConv.lastMessage.id : 0;
   // A conversation we haven't seen yet arrives with a server-computed unreadCount.
   let fetched = false;
   if (!getConversation(convId)) {
@@ -110,9 +116,13 @@ async function handleIncoming(message) {
       /* will show up on the next refresh */
     }
   }
-  const added = addMessages(convId, [message]);
+  const before = findMessage(convId, message.id);
+  const added = addMessages(convId, [message], { live: true });
   const mine = state.me && message.senderId === state.me.id;
-  if (mine || !added.length) return;
+  const isNew = added.length > 0 && message.id > known;
+  // Unsent before I read it: like the server, stop counting it.
+  if (!mine && !isNew && message.deletedAt && !(before && before.deletedAt)) uncountUnread(convId, message.id);
+  if (mine || !isNew) return;
 
   clearTyping(convId, message.senderId);
   const conv = getConversation(convId);
@@ -123,7 +133,8 @@ async function handleIncoming(message) {
     maybeMarkRead();
     announce(message.system ? text : `${who}: ${text}`);
   } else {
-    if (!fetched) incrementUnread(convId);
+    // System lines ("Jordan added Sam") aren't unread messages, on the server either.
+    if (!fetched && !message.system) incrementUnread(convId);
     const where = conv && conv.isGroup ? ` in ${conversationTitle(conv)}` : '';
     announce(`New message from ${who}${where}`);
   }
